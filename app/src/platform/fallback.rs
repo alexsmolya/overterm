@@ -61,12 +61,7 @@ pub fn process_name(_pid: i32) -> Option<String> {
 /// the path is the only thing that says what it is.
 #[cfg(target_os = "linux")]
 pub fn process_path(pid: i32) -> Option<String> {
-    fs::read_link(proc_path(pid, "exe"))
-        .ok()?
-        .into_os_string()
-        .into_string()
-        .ok()
-        .filter(|path| !path.is_empty())
+    read_proc_symlink(pid, "exe")
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -96,12 +91,7 @@ pub fn process_args(_pid: i32) -> Option<Vec<String>> {
 /// than showing a wrong one.
 #[cfg(target_os = "linux")]
 pub fn process_cwd(pid: i32) -> Option<String> {
-    fs::read_link(proc_path(pid, "cwd"))
-        .ok()?
-        .into_os_string()
-        .into_string()
-        .ok()
-        .filter(|path| !path.is_empty())
+    read_proc_symlink(pid, "cwd")
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -112,6 +102,29 @@ pub fn process_cwd(_pid: i32) -> Option<String> {
 #[cfg(target_os = "linux")]
 fn proc_path(pid: i32, entry: &str) -> PathBuf {
     PathBuf::from(format!("/proc/{pid}/{entry}"))
+}
+
+/// Shared by `process_path` and `process_cwd`, which are both a symlink
+/// under `/proc/<pid>` and both need the same cleanup.
+#[cfg(target_os = "linux")]
+fn read_proc_symlink(pid: i32, entry: &str) -> Option<String> {
+    let path = fs::read_link(proc_path(pid, entry))
+        .ok()?
+        .into_os_string()
+        .into_string()
+        .ok()?;
+    strip_deleted_marker(&path)
+}
+
+/// The kernel appends ` (deleted)` to a symlink's target when whatever it
+/// pointed at is gone, rather than leaving a broken link: an exe replaced
+/// by a package update while it keeps running, or a shell's cwd removed
+/// out from under it without it leaving. Left in, that string ends up
+/// wherever the caller shows the path.
+#[cfg(target_os = "linux")]
+fn strip_deleted_marker(path: &str) -> Option<String> {
+    let path = path.strip_suffix(" (deleted)").unwrap_or(path);
+    (!path.is_empty()).then(|| path.to_string())
 }
 
 #[cfg(target_os = "linux")]
@@ -179,6 +192,18 @@ mod tests {
                 "tool.js".to_string(),
                 "--model".to_string()
             ])
+        );
+    }
+
+    #[test]
+    fn strips_the_kernel_deleted_marker_but_not_a_real_path() {
+        assert_eq!(
+            strip_deleted_marker("/usr/local/bin/node (deleted)"),
+            Some("/usr/local/bin/node".to_string())
+        );
+        assert_eq!(
+            strip_deleted_marker("/usr/local/bin/node"),
+            Some("/usr/local/bin/node".to_string())
         );
     }
 }
