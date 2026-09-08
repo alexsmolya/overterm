@@ -129,7 +129,12 @@ fn strip_deleted_marker(path: &str) -> Option<String> {
 
 #[cfg(target_os = "linux")]
 fn parse_proc_args(mut args: &[u8]) -> Option<Vec<String>> {
-    if args.last() == Some(&0) {
+    // Usually one terminator, but a process that rewrote its own title to
+    // something shorter (Node's `process.title`, which Pi uses) can't
+    // shrink `/proc/<pid>/cmdline`'s reported length without
+    // CAP_SYS_RESOURCE, so the tail is zero-padded instead. Stripping
+    // only the last byte would turn that padding into empty arguments.
+    while args.last() == Some(&0) {
         args = &args[..args.len() - 1];
     }
     if args.is_empty() {
@@ -192,6 +197,17 @@ mod tests {
                 "tool.js".to_string(),
                 "--model".to_string()
             ])
+        );
+    }
+
+    #[test]
+    fn a_shortened_process_title_does_not_leave_empty_arguments() {
+        // What `process.title = 'pi'` leaves behind on Linux: the new
+        // title, then the unused tail of the original cmdline zeroed out
+        // rather than shrunk.
+        assert_eq!(
+            parse_proc_args(b"pi\0\0\0\0\0\0\0\0\0\0"),
+            Some(vec!["pi".to_string()])
         );
     }
 
