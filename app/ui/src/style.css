@@ -346,6 +346,20 @@ body.attention-needs::after {
   cursor: pointer;
 }
 
+#codex-open {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-tile);
+  background: var(--chrome);
+  color: var(--ink-2);
+  font: 600 12px/1 var(--mono);
+  cursor: pointer;
+}
+
+#codex-open:hover { color: var(--ink); border-color: var(--ring); }
+
 #tab-add:hover,
 .tab:not(.active):hover {
   color: var(--ink-2);
@@ -674,6 +688,23 @@ body.state-busy .pill .dot {
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
   overflow: hidden;
 }
+
+#codex-sheet {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  background: var(--scrim);
+}
+
+.codex-sheet-body { width: min(520px, calc(100% - 32px)); max-height: min(620px, calc(100% - 32px)); }
+.sheet-head small { color: var(--ink-3); font-weight: 500; margin-left: 6px; }
+.codex-threads { display: grid; gap: 7px; max-height: 400px; overflow-y: auto; color: var(--ink-3); font-size: 12px; }
+.codex-thread { display: grid; gap: 4px; text-align: left; padding: 10px; border: 1px solid var(--line); border-radius: var(--radius-control); background: var(--body); color: var(--ink); cursor: pointer; font: 500 12px/1.25 var(--mono); }
+.codex-thread:hover { border-color: var(--ring); background: var(--chrome); }
+.codex-thread small { color: var(--ink-3); font: 400 10px/1.25 var(--mono); }
+.codex-actions { margin-top: 12px; }
 
 .sheet-head {
   flex: none;

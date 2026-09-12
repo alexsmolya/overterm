@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod choreograph;
+mod codex;
 mod hooks;
 mod pi;
 mod platform;
@@ -59,6 +60,7 @@ fn main() {
 
     tauri::Builder::default()
         .manage(pty::Sessions::default())
+        .manage(codex::CodexSessions::default())
         .manage({
             let stored = settings::load();
             let (width, height) =
@@ -135,6 +137,10 @@ fn main() {
             pty::write_pty,
             pty::resize_pty,
             pty::kill_session,
+            codex::codex_list_threads,
+            codex::codex_attach_thread,
+            codex::codex_detach,
+            codex::codex_status,
             choreograph::set_window_mode,
             choreograph::window_mode,
             choreograph::hide_window,

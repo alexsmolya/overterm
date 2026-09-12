@@ -114,6 +114,10 @@ let active: Session | null = null;
 const terminalsEl = document.getElementById('terminals') as HTMLDivElement;
 const tabsEl = document.getElementById('tabs') as HTMLElement;
 const tabAdd = document.getElementById('tab-add') as HTMLButtonElement;
+const codexOpen = document.getElementById('codex-open') as HTMLButtonElement;
+
+type CodexThread = { id: string; title: string; workspace: string | null; updatedAt: number | null; status: string };
+type CodexStatus = { available: boolean; connected: boolean; subscribedThreadId: string | null; threadStatus: string; detail: string };
 
 /// Read one palette value out of the stylesheet.
 ///
@@ -207,6 +211,75 @@ const stateLabels: Record<AgentState, string> = {
   needsInput: 'needs input',
   done: 'done',
 };
+
+// --- Codex read-only view -------------------------------------------
+
+const codexSheet = document.getElementById('codex-sheet')!;
+const codexThreads = document.getElementById('codex-threads')!;
+const codexNote = document.getElementById('codex-note')!;
+const codexDetach = document.getElementById('codex-detach') as HTMLButtonElement;
+
+function codexTime(value: number | null): string {
+  if (!value) return 'unknown time';
+  return new Date(value * 1000).toLocaleString();
+}
+
+function showCodexThreads(threads: CodexThread[]) {
+  codexThreads.replaceChildren();
+  if (!threads.length) {
+    codexThreads.textContent = 'No retained Codex threads found.';
+    return;
+  }
+  for (const thread of threads) {
+    const button = document.createElement('button');
+    button.className = 'codex-thread';
+    const hint = [thread.workspace, thread.status, codexTime(thread.updatedAt)].filter(Boolean).join(' · ');
+    button.innerHTML = `<strong></strong><small></small>`;
+    button.querySelector('strong')!.textContent = thread.title;
+    button.querySelector('small')!.textContent = hint;
+    button.addEventListener('click', async () => {
+      codexNote.textContent = 'Attaching read-only…';
+      try {
+        await invoke('codex_attach_thread', { threadId: thread.id });
+        codexNote.textContent = 'Read-only attachment active.';
+        codexDetach.hidden = false;
+      } catch {
+        codexNote.textContent = 'Codex could not attach to this thread.';
+      }
+    });
+    codexThreads.appendChild(button);
+  }
+}
+
+async function refreshCodex() {
+  codexNote.textContent = 'Reading retained thread metadata…';
+  try {
+    const threads = await invoke<CodexThread[]>('codex_list_threads');
+    showCodexThreads(threads);
+    const status = await invoke<CodexStatus>('codex_status');
+    codexNote.textContent = status.detail;
+    codexDetach.hidden = !status.subscribedThreadId;
+  } catch {
+    codexThreads.replaceChildren();
+    codexNote.textContent = 'Codex integration unavailable or incompatible.';
+    codexDetach.hidden = true;
+  }
+}
+
+function openCodex() { codexSheet.hidden = false; void refreshCodex(); }
+function closeCodex() {
+  // Closing this read-only view ends the owned attachment rather than leaving
+  // a background Codex child behind after the user can no longer inspect it.
+  void invoke('codex_detach');
+  codexSheet.hidden = true;
+}
+codexOpen.addEventListener('click', openCodex);
+(document.getElementById('codex-close') as HTMLButtonElement).addEventListener('click', closeCodex);
+(document.getElementById('codex-refresh') as HTMLButtonElement).addEventListener('click', () => void refreshCodex());
+codexDetach.addEventListener('click', async () => {
+  try { await invoke('codex_detach'); codexNote.textContent = 'Detached.'; codexDetach.hidden = true; }
+  catch { codexNote.textContent = 'Codex could not detach cleanly.'; }
+});
 
 function setAgentState(session: Session, state: AgentState, cause: string) {
   // A turn that just ended is worth remembering the length of.
