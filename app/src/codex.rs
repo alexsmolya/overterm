@@ -19,8 +19,6 @@ use tauri::State;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_GRACE: Duration = Duration::from_millis(750);
 const THREAD_LIMIT: u64 = 20;
-const TURN_LIMIT: u64 = 5;
-const ITEM_LIMIT: u64 = 10;
 const STDERR_BUFFER: usize = 1024;
 
 /// There must never be a write method in this list. Keep it public to make
@@ -29,8 +27,6 @@ pub const READ_ONLY_METHODS: &[&str] = &[
     "initialize",
     "thread/list",
     "thread/read",
-    "thread/turns/list",
-    "thread/items/list",
     "thread/resume",
     "thread/unsubscribe",
 ];
@@ -180,6 +176,7 @@ struct Client {
     next_id: u64,
     pending: HashMap<u64, Result<Value, String>>,
     notifications: VecDeque<String>,
+    requests: VecDeque<String>,
     subscribed: Option<String>,
     status: String,
 }
@@ -230,6 +227,7 @@ impl Client {
             next_id: 1,
             pending: HashMap::new(),
             notifications: VecDeque::new(),
+            requests: VecDeque::new(),
             subscribed: None,
             status: "connected".into(),
         };
@@ -263,6 +261,10 @@ impl Client {
         if !READ_ONLY_METHODS.contains(&method) {
             return Err("Codex integration rejected a write-capable method".into());
         }
+        if self.requests.len() == 16 {
+            self.requests.pop_front();
+        }
+        self.requests.push_back(method.to_string());
         let id = self.next_id;
         self.next_id += 1;
         self.write(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))?;
@@ -355,16 +357,18 @@ impl Client {
     }
 
     fn attach(&mut self, id: &str) -> Result<(), String> {
+        if self.subscribed.as_deref() == Some(id) {
+            return Ok(());
+        }
+        // Release the current subscription first. A failed unsubscribe leaves
+        // the old ID recorded and aborts the replacement, so the client never
+        // claims a different single-subscription state than the server knows.
+        if let Some(current) = self.subscribed.clone() {
+            self.request("thread/unsubscribe", json!({"threadId":current}))?;
+            self.subscribed = None;
+            self.status = "connected".into();
+        }
         self.request("thread/read", json!({"threadId":id,"includeTurns":false}))?;
-        // Bounded metadata pagination deliberately discards all item bodies.
-        let _ = self.request(
-            "thread/turns/list",
-            json!({"threadId":id,"limit":TURN_LIMIT,"itemsView":"summary"}),
-        );
-        let _ = self.request(
-            "thread/items/list",
-            json!({"threadId":id,"limit":ITEM_LIMIT}),
-        );
         self.request("thread/resume", json!({"threadId":id,"excludeTurns":true}))?;
         self.subscribed = Some(id.to_string());
         self.status = "subscribed".into();
@@ -593,10 +597,8 @@ mod tests {
             "' '{\"id\":1,\"result\":{\"platformOs\":\"linux\"}}'; ",
             "read _; read _; printf '%s\\n' '{\"id\":2,\"result\":{\"data\":[{\"id\":\"fixture\",\"name\":\"Fixture\",\"cwd\":\"/fixture/project\",\"status\":{\"type\":\"idle\"}}]}}'; ",
             "read _; printf '%s\\n' '{\"id\":3,\"result\":{\"thread\":{\"id\":\"fixture\"}}}'; ",
-            "read _; printf '%s\\n' '{\"id\":4,\"result\":{\"data\":[]}}'; ",
-            "read _; printf '%s\\n' '{\"id\":5,\"result\":{\"data\":[]}}'; ",
-            "read _; printf '%s\\n' '{\"id\":6,\"result\":{\"thread\":{\"id\":\"fixture\"}}}'; ",
-            "read _; printf '%s\\n' '{\"id\":7,\"result\":{\"status\":\"unsubscribed\"}}'"
+            "read _; printf '%s\\n' '{\"id\":4,\"result\":{\"thread\":{\"id\":\"fixture\"}}}'; ",
+            "read _; printf '%s\\n' '{\"id\":5,\"result\":{\"status\":\"unsubscribed\"}}'; sleep 1"
         );
         let mut client = Client::start_command("/bin/sh", ["-c", script]).expect("handshake");
         let threads = client.list().expect("bounded list");
@@ -611,6 +613,76 @@ mod tests {
                 .any(|method| method == "thread/status/changed")
         );
         client.detach().expect("unsubscribe");
+        assert!(client.subscribed.is_none());
+        client.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn switching_threads_balances_subscriptions_and_keeps_failures_fail_closed() {
+        // The fixture answers the exact A -> unsubscribe A -> B ->
+        // unsubscribe B sequence; the request log below proves those
+        // transitions were emitted in that order.
+        let script = concat!(
+            "printf '%s\\n' '{\"id\":1,\"result\":{\"platformOs\":\"linux\"}}'; ",
+            "read _; read _; printf '%s\\n' '{\"id\":2,\"result\":{\"thread\":{\"id\":\"A\"}}}'; ",
+            "read _; printf '%s\\n' '{\"id\":3,\"result\":{\"thread\":{\"id\":\"A\"}}}'; ",
+            "read _; printf '%s\\n' '{\"id\":4,\"result\":{}}'; ",
+            "read _; printf '%s\\n' '{\"id\":5,\"result\":{\"thread\":{\"id\":\"B\"}}}'; ",
+            "read _; printf '%s\\n' '{\"id\":6,\"result\":{\"thread\":{\"id\":\"B\"}}}'; ",
+            "read _; printf '%s\\n' '{\"id\":7,\"result\":{}}'; sleep 1"
+        );
+        let mut client = Client::start_command("/bin/sh", ["-c", script]).expect("handshake");
+        client.attach("A").expect("attach A");
+        assert_eq!(client.subscribed.as_deref(), Some("A"));
+        client.attach("B").expect("switch A to B");
+        assert_eq!(client.subscribed.as_deref(), Some("B"));
+        client.detach().expect("detach B");
+        assert!(client.subscribed.is_none());
+        assert_eq!(
+            client.requests.iter().collect::<Vec<_>>(),
+            [
+                &"initialize".to_string(),
+                &"thread/read".to_string(),
+                &"thread/resume".to_string(),
+                &"thread/unsubscribe".to_string(),
+                &"thread/read".to_string(),
+                &"thread/resume".to_string(),
+                &"thread/unsubscribe".to_string(),
+            ]
+        );
+        client.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_unsubscribe_keeps_the_old_subscription_recorded() {
+        let script = concat!(
+            "printf '%s\\n' '{\"id\":1,\"result\":{\"platformOs\":\"linux\"}}'; ",
+            "read _; read _; printf '%s\\n' '{\"id\":2,\"result\":{}}'; ",
+            "read _; printf '%s\\n' '{\"id\":3,\"result\":{}}'; ",
+            "read _; printf '%s\\n' '{\"id\":4,\"error\":{\"code\":-32000}}'; sleep 10"
+        );
+        let mut client = Client::start_command("/bin/sh", ["-c", script]).expect("handshake");
+        client.attach("A").expect("attach A");
+        assert!(client.attach("B").is_err());
+        assert_eq!(client.subscribed.as_deref(), Some("A"));
+        client.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_replacement_resume_leaves_no_subscription_claimed() {
+        let script = concat!(
+            "printf '%s\\n' '{\"id\":1,\"result\":{\"platformOs\":\"linux\"}}'; ",
+            "read _; read _; printf '%s\\n' '{\"id\":2,\"result\":{}}'; ",
+            "read _; printf '%s\\n' '{\"id\":3,\"result\":{}}'; ",
+            "read _; printf '%s\\n' '{\"id\":4,\"result\":{\"thread\":{\"id\":\"B\"}}}'; ",
+            "read _; printf '%s\\n' '{\"id\":5,\"error\":{\"code\":-32000}}'; sleep 10"
+        );
+        let mut client = Client::start_command("/bin/sh", ["-c", script]).expect("handshake");
+        client.attach("A").expect("attach A");
+        assert!(client.attach("B").is_err());
         assert!(client.subscribed.is_none());
         client.shutdown();
     }
