@@ -174,11 +174,25 @@ struct Client {
     stdin: ChildStdin,
     rx: Receiver<Incoming>,
     next_id: u64,
-    pending: HashMap<u64, Result<Value, String>>,
+    pending: HashMap<u64, Result<Value, RequestFailure>>,
     notifications: VecDeque<String>,
     requests: VecDeque<String>,
     subscribed: Option<String>,
     status: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RequestFailure {
+    Rejected(String),
+    Ambiguous(String),
+}
+
+impl RequestFailure {
+    fn message(&self) -> &str {
+        match self {
+            Self::Rejected(message) | Self::Ambiguous(message) => message,
+        }
+    }
 }
 
 impl Client {
@@ -235,7 +249,7 @@ impl Client {
             Ok(response) => response,
             Err(error) => {
                 client.shutdown();
-                return Err(error);
+                return Err(error.message().to_string());
             }
         };
         if init.get("platformOs").and_then(Value::as_str).is_none() {
@@ -244,22 +258,26 @@ impl Client {
         }
         if let Err(error) = client.notify("initialized", json!({})) {
             client.shutdown();
-            return Err(error);
+            return Err(error.message().to_string());
         }
         Ok(client)
     }
 
-    fn notify(&mut self, method: &str, params: Value) -> Result<(), String> {
+    fn notify(&mut self, method: &str, params: Value) -> Result<(), RequestFailure> {
         // `initialized` is the only notification this client may emit.
         if method != "initialized" {
-            return Err("Codex integration rejected a non-read-only notification".into());
+            return Err(RequestFailure::Rejected(
+                "Codex integration rejected a non-read-only notification".into(),
+            ));
         }
         self.write(json!({"jsonrpc":"2.0","method":method,"params":params}))
     }
 
-    fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+    fn request(&mut self, method: &str, params: Value) -> Result<Value, RequestFailure> {
         if !READ_ONLY_METHODS.contains(&method) {
-            return Err("Codex integration rejected a write-capable method".into());
+            return Err(RequestFailure::Rejected(
+                "Codex integration rejected a write-capable method".into(),
+            ));
         }
         if self.requests.len() == 16 {
             self.requests.pop_front();
@@ -271,16 +289,16 @@ impl Client {
         self.await_response(id)
     }
 
-    fn write(&mut self, value: Value) -> Result<(), String> {
+    fn write(&mut self, value: Value) -> Result<(), RequestFailure> {
         serde_json::to_writer(&mut self.stdin, &value)
-            .map_err(|_| "Codex integration protocol error".to_string())?;
+            .map_err(|_| RequestFailure::Ambiguous("Codex integration protocol error".into()))?;
         self.stdin
             .write_all(b"\n")
             .and_then(|_| self.stdin.flush())
-            .map_err(|_| "Codex integration connection closed".to_string())
+            .map_err(|_| RequestFailure::Ambiguous("Codex integration connection closed".into()))
     }
 
-    fn await_response(&mut self, wanted: u64) -> Result<Value, String> {
+    fn await_response(&mut self, wanted: u64) -> Result<Value, RequestFailure> {
         let deadline = Instant::now() + REQUEST_TIMEOUT;
         loop {
             if let Some(response) = self.pending.remove(&wanted) {
@@ -288,14 +306,20 @@ impl Client {
             }
             let wait = deadline.saturating_duration_since(Instant::now());
             if wait.is_zero() {
-                return Err("Codex integration request timed out".into());
+                return Err(RequestFailure::Ambiguous(
+                    "Codex integration request timed out".into(),
+                ));
             }
             match self.rx.recv_timeout(wait) {
                 Ok(Incoming::Response { id, result, error }) => {
                     let reply = match (result, error) {
                         (Some(result), None) => Ok(result),
-                        (_, Some(_)) => Err("Codex integration request was rejected".into()),
-                        _ => Err("Codex integration incompatible response".into()),
+                        (_, Some(_)) => Err(RequestFailure::Rejected(
+                            "Codex integration request was rejected".into(),
+                        )),
+                        _ => Err(RequestFailure::Ambiguous(
+                            "Codex integration incompatible response".into(),
+                        )),
                     };
                     if id == wanted {
                         return reply;
@@ -309,14 +333,24 @@ impl Client {
                     self.push_notice(format!("server request ignored: {method}"))
                 }
                 Ok(Incoming::Malformed) => {
-                    return Err("Codex integration incompatible: malformed protocol frame".into());
+                    return Err(RequestFailure::Ambiguous(
+                        "Codex integration incompatible: malformed protocol frame".into(),
+                    ));
                 }
-                Ok(Incoming::Eof) => return Err("Codex integration connection closed".into()),
+                Ok(Incoming::Eof) => {
+                    return Err(RequestFailure::Ambiguous(
+                        "Codex integration connection closed".into(),
+                    ));
+                }
                 Err(RecvTimeoutError::Timeout) => {
-                    return Err("Codex integration request timed out".into());
+                    return Err(RequestFailure::Ambiguous(
+                        "Codex integration request timed out".into(),
+                    ));
                 }
                 Err(RecvTimeoutError::Disconnected) => {
-                    return Err("Codex integration connection closed".into());
+                    return Err(RequestFailure::Ambiguous(
+                        "Codex integration connection closed".into(),
+                    ));
                 }
             }
         }
@@ -341,7 +375,7 @@ impl Client {
         self.notifications.push_back(value);
     }
 
-    fn list(&mut self) -> Result<Vec<ThreadSummary>, String> {
+    fn list(&mut self) -> Result<Vec<ThreadSummary>, RequestFailure> {
         let value = self.request(
             "thread/list",
             json!({"limit":THREAD_LIMIT,"archived":false,"useStateDbOnly":true}),
@@ -356,7 +390,7 @@ impl Client {
             .collect())
     }
 
-    fn attach(&mut self, id: &str) -> Result<(), String> {
+    fn attach(&mut self, id: &str) -> Result<(), RequestFailure> {
         if self.subscribed.as_deref() == Some(id) {
             return Ok(());
         }
@@ -375,7 +409,7 @@ impl Client {
         Ok(())
     }
 
-    fn detach(&mut self) -> Result<(), String> {
+    fn detach(&mut self) -> Result<(), RequestFailure> {
         if let Some(id) = self.subscribed.clone() {
             self.request("thread/unsubscribe", json!({"threadId":id}))?;
             self.subscribed = None;
@@ -394,6 +428,15 @@ impl Client {
                 Ok(None) => thread::sleep(Duration::from_millis(25)),
             }
         }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+
+    /// Close the transport without attempting another RPC. This is required
+    /// when a request outcome is ambiguous: the server may already have
+    /// applied it, so connection closure is the only safe subscription reset.
+    fn invalidate(mut self) {
+        drop(self.stdin);
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -444,7 +487,7 @@ impl Drop for CodexSessions {
 
 fn with_client<T>(
     sessions: &CodexSessions,
-    f: impl FnOnce(&mut Client) -> Result<T, String>,
+    f: impl FnOnce(&mut Client) -> Result<T, RequestFailure>,
 ) -> Result<T, String> {
     let mut guard = sessions
         .0
@@ -456,12 +499,12 @@ fn with_client<T>(
     match f(guard.as_mut().expect("set above")) {
         Ok(value) => Ok(value),
         Err(error) => {
-            if (error.contains("connection closed") || error.contains("incompatible"))
+            if matches!(error, RequestFailure::Ambiguous(_))
                 && let Some(client) = guard.take()
             {
-                client.shutdown();
+                client.invalidate();
             }
-            Err(error)
+            Err(error.message().to_string())
         }
     }
 }
@@ -687,6 +730,49 @@ mod tests {
         client.shutdown();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ambiguous_resume_timeout_invalidates_session_and_reaps_child() {
+        let marker = std::env::temp_dir().join(format!(
+            "overterm-codex-ambiguous-resume-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let script = format!(
+            "printf '%s\\n' '{{\"id\":1,\"result\":{{\"platformOs\":\"linux\"}}}}'; \\
+             read _; read _; printf '%s\\n' '{{\"id\":2,\"result\":{{\"thread\":{{\"id\":\"A\"}}}}}}'; \\
+             read _; printf '%s\\n' '{{\"id\":3,\"result\":{{\"thread\":{{\"id\":\"A\"}}}}}}'; \\
+             read _; printf '%s\\n' '{{\"id\":4,\"result\":{{}}}}'; \\
+             read _; printf '%s\\n' '{{\"id\":5,\"result\":{{\"thread\":{{\"id\":\"B\"}}}}}}'; \\
+             read _; echo $$ > '{}'; sleep 30",
+            marker.display()
+        );
+        let client = Client::start_command("/bin/sh", ["-c", &script]).expect("handshake");
+        let child_pid = client.child.id();
+        let sessions = CodexSessions(Arc::new(Mutex::new(Some(client))));
+        with_client(&sessions, |client| client.attach("A")).expect("attach A");
+        let started = Instant::now();
+        let error = with_client(&sessions, |client| client.attach("B"))
+            .expect_err("withheld resume response should time out");
+        assert_eq!(error, "Codex integration request timed out");
+        assert!(started.elapsed() >= REQUEST_TIMEOUT);
+        assert!(marker.exists(), "fixture must consume thread/resume(B)");
+        assert!(
+            sessions.0.lock().unwrap().is_none(),
+            "ambiguous outcome must not leave a client with no recorded subscription"
+        );
+        assert!(
+            !Command::new("kill")
+                .args(["-0", &child_pid.to_string()])
+                .stderr(Stdio::null())
+                .status()
+                .expect("check child liveness")
+                .success(),
+            "owned app-server child must be reaped"
+        );
+        let _ = std::fs::remove_file(marker);
+    }
+
     #[test]
     fn missing_executable_is_non_fatal() {
         let error = match Client::start_command("overterm-codex-does-not-exist", []) {
@@ -764,7 +850,7 @@ mod tests {
         let started = Instant::now();
         assert_eq!(
             client.list().unwrap_err(),
-            "Codex integration request timed out"
+            RequestFailure::Ambiguous("Codex integration request timed out".into())
         );
         assert!(started.elapsed() >= REQUEST_TIMEOUT);
         client.shutdown();
