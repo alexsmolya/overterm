@@ -4,22 +4,29 @@
 //! the complete surface exposed to the webview; write-capable Codex methods
 //! cannot be emitted by this module.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use overterm_core::{AgentState, Signal, StateChange};
 use serde::Serialize;
 use serde_json::{Value, json};
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
+
+use crate::choreograph::Choreographer;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const EXIT_GRACE: Duration = Duration::from_millis(750);
 const THREAD_LIMIT: u64 = 20;
 const STDERR_BUFFER: usize = 1024;
+const CODEX_SESSION_ID: &str = "codex-readonly";
+const EVENT_CODEX_STATUS: &str = "overterm://codex-status";
+
+type PendingResponses = Arc<Mutex<HashMap<u64, Sender<Result<Value, RequestFailure>>>>>;
 
 /// There must never be a write method in this list. Keep it public to make
 /// that privacy boundary mechanically testable.
@@ -49,6 +56,7 @@ pub struct CodexStatus {
     pub subscribed_thread_id: Option<String>,
     pub thread_status: String,
     pub detail: String,
+    pub cause: String,
     pub notifications: Vec<String>,
 }
 
@@ -60,6 +68,7 @@ impl Default for CodexStatus {
             subscribed_thread_id: None,
             thread_status: "disconnected".into(),
             detail: "Codex is off".into(),
+            cause: "disconnected".into(),
             notifications: Vec::new(),
         }
     }
@@ -77,25 +86,11 @@ enum Incoming {
         params: Value,
     },
     ServerRequest {
+        id: u64,
         method: String,
+        params: Value,
     },
     Malformed,
-    Eof,
-}
-
-fn read_stdout(stdout: ChildStdout, tx: mpsc::Sender<Incoming>) {
-    let reader = BufReader::new(stdout);
-    for line in reader.lines() {
-        let Ok(line) = line else { break };
-        let item = match serde_json::from_str::<Value>(&line) {
-            Ok(value) => classify(value),
-            Err(_) => Incoming::Malformed,
-        };
-        if tx.send(item).is_err() {
-            return;
-        }
-    }
-    let _ = tx.send(Incoming::Eof);
 }
 
 /// JSONL framing is independent from process I/O so fragmented and coalesced
@@ -150,8 +145,10 @@ fn classify(value: Value) -> Incoming {
             result: value.get("result").cloned(),
             error: value.get("error").cloned(),
         },
-        (Some(_), Some(method)) => Incoming::ServerRequest {
+        (Some(id), Some(method)) => Incoming::ServerRequest {
+            id,
             method: bounded_method(&method),
+            params: value.get("params").cloned().unwrap_or(Value::Null),
         },
         (None, Some(method)) => Incoming::Notification {
             method: bounded_method(&method),
@@ -169,22 +166,290 @@ fn bounded_method(method: &str) -> String {
         .collect()
 }
 
-struct Client {
-    child: Child,
-    stdin: ChildStdin,
-    rx: Receiver<Incoming>,
-    next_id: u64,
-    pending: HashMap<u64, Result<Value, RequestFailure>>,
-    notifications: VecDeque<String>,
-    requests: VecDeque<String>,
-    subscribed: Option<String>,
-    status: String,
+fn pump_stdout(
+    stdout: ChildStdout,
+    pending: PendingResponses,
+    orphaned: Arc<Mutex<HashMap<u64, Result<Value, RequestFailure>>>>,
+    live: Arc<Mutex<LiveState>>,
+    observer: Arc<Mutex<Option<LiveObserver>>>,
+    child: Arc<Mutex<Option<Child>>>,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+) {
+    let reader = BufReader::new(stdout);
+    for line in reader.lines() {
+        let item = match line.and_then(|line| {
+            serde_json::from_str::<Value>(&line)
+                .map(classify)
+                .map_err(std::io::Error::other)
+        }) {
+            Ok(item) => item,
+            Err(_) => Incoming::Malformed,
+        };
+        match item {
+            Incoming::Response { id, result, error } => {
+                let reply = match (result, error) {
+                    (Some(result), None) => Ok(result),
+                    (_, Some(_)) => Err(RequestFailure::Rejected(
+                        "Codex integration request was rejected".into(),
+                    )),
+                    _ => Err(RequestFailure::Ambiguous(
+                        "Codex integration incompatible response".into(),
+                    )),
+                };
+                if let Some(tx) = pending.lock().unwrap().remove(&id) {
+                    let _ = tx.send(reply);
+                } else {
+                    orphaned.lock().unwrap().insert(id, reply);
+                }
+            }
+            Incoming::Notification { method, params } => {
+                live.lock().unwrap().observe_notification(&method, &params);
+                notify_observer(&live, &observer);
+            }
+            Incoming::ServerRequest { id, method, params } => {
+                live.lock().unwrap().observe_request(id, &method, &params);
+                notify_observer(&live, &observer);
+            }
+            Incoming::Malformed => {
+                live.lock().unwrap().detach("unavailable");
+                notify_observer(&live, &observer);
+                let mut pending = pending.lock().unwrap();
+                for (_, tx) in pending.drain() {
+                    let _ = tx.send(Err(RequestFailure::Ambiguous(
+                        "Codex integration incompatible: malformed protocol frame".into(),
+                    )));
+                }
+                stdin.lock().unwrap().take();
+                if let Some(mut child) = child.lock().unwrap().take() {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                return;
+            }
+        }
+    }
+    live.lock().unwrap().detach("unavailable");
+    notify_observer(&live, &observer);
+    stdin.lock().unwrap().take();
+    if let Some(mut child) = child.lock().unwrap().take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let mut pending = pending.lock().unwrap();
+    for (_, tx) in pending.drain() {
+        let _ = tx.send(Err(RequestFailure::Ambiguous(
+            "Codex integration connection closed".into(),
+        )));
+    }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+fn notify_observer(live: &Arc<Mutex<LiveState>>, observer: &Arc<Mutex<Option<LiveObserver>>>) {
+    let snapshot = live.lock().unwrap().snapshot();
+    let observer = observer.lock().unwrap().clone();
+    if let Some(observer) = observer {
+        observer(snapshot);
+    }
+}
+
+struct Client {
+    child: Arc<Mutex<Option<Child>>>,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    next_id: u64,
+    pending: PendingResponses,
+    orphaned: Arc<Mutex<HashMap<u64, Result<Value, RequestFailure>>>>,
+    requests: VecDeque<String>,
+    subscribed: Option<String>,
+    live: Arc<Mutex<LiveState>>,
+    observer: Arc<Mutex<Option<LiveObserver>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum RequestFailure {
     Rejected(String),
     Ambiguous(String),
+}
+
+/// The only Codex protocol state retained after a frame is read. In
+/// particular this deliberately has no item, message, tool, command, path,
+/// diff, or approval payload fields.
+#[derive(Debug)]
+struct LiveState {
+    selected: Option<String>,
+    state: AgentState,
+    cause: String,
+    active_turn: Option<String>,
+    pending_requests: HashSet<String>,
+    connected: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LiveSnapshot {
+    selected_thread_id: Option<String>,
+    state: AgentState,
+    cause: String,
+    connected: bool,
+}
+
+type LiveObserver = Arc<dyn Fn(LiveSnapshot) + Send + Sync>;
+
+impl Default for LiveState {
+    fn default() -> Self {
+        Self {
+            selected: None,
+            state: AgentState::Idle,
+            cause: "connected".into(),
+            active_turn: None,
+            pending_requests: HashSet::new(),
+            connected: true,
+        }
+    }
+}
+
+impl LiveState {
+    fn snapshot(&self) -> LiveSnapshot {
+        LiveSnapshot {
+            selected_thread_id: self.selected.clone(),
+            state: self.state,
+            cause: self.cause.clone(),
+            connected: self.connected,
+        }
+    }
+    fn select(&mut self, thread_id: &str) {
+        self.selected = Some(thread_id.to_string());
+        self.state = AgentState::Idle;
+        self.cause = "connected".into();
+        self.active_turn = None;
+        self.pending_requests.clear();
+        self.connected = true;
+    }
+
+    fn detach(&mut self, cause: &str) {
+        self.selected = None;
+        self.active_turn = None;
+        self.pending_requests.clear();
+        self.state = AgentState::Idle;
+        self.cause = cause.into();
+        self.connected = false;
+    }
+
+    fn selected(&self, params: &Value) -> bool {
+        self.selected.as_deref() == params.get("threadId").and_then(Value::as_str)
+    }
+
+    fn set_state(&mut self, state: AgentState, cause: &str) {
+        self.state = state;
+        self.cause = cause.into();
+    }
+
+    fn observe_notification(&mut self, method: &str, params: &Value) {
+        if !self.selected(params) {
+            return;
+        }
+        match method {
+            "turn/started" => {
+                self.active_turn = params
+                    .get("turn")
+                    .and_then(|turn| turn.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if self.pending_requests.is_empty() {
+                    self.set_state(AgentState::Busy, "active");
+                }
+            }
+            "turn/completed" => match params
+                .get("turn")
+                .and_then(|turn| turn.get("status"))
+                .and_then(Value::as_str)
+            {
+                Some("completed") => {
+                    self.active_turn = None;
+                    self.pending_requests.clear();
+                    self.set_state(AgentState::Done, "completed");
+                }
+                Some("interrupted") => {
+                    self.active_turn = None;
+                    self.pending_requests.clear();
+                    self.set_state(AgentState::Done, "interrupted");
+                }
+                Some("failed") => {
+                    self.active_turn = None;
+                    self.pending_requests.clear();
+                    self.set_state(AgentState::Done, "failed");
+                }
+                _ => {}
+            },
+            "thread/status/changed" => {
+                let status = params.get("status");
+                let active = status
+                    .and_then(|value| value.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("active");
+                let waiting = status
+                    .and_then(|value| value.get("activeFlags"))
+                    .and_then(Value::as_array)
+                    .is_some_and(|flags| {
+                        flags.iter().any(|flag| {
+                            matches!(
+                                flag.as_str(),
+                                Some("waitingOnApproval" | "waitingOnUserInput")
+                            )
+                        })
+                    });
+                if waiting || !self.pending_requests.is_empty() {
+                    self.set_state(AgentState::NeedsInput, "needs input");
+                } else if active {
+                    self.set_state(AgentState::Busy, "active");
+                } else if status
+                    .and_then(|value| value.get("type"))
+                    .and_then(Value::as_str)
+                    == Some("idle")
+                {
+                    // An attached historical idle thread is not a completed
+                    // turn, so it must not create a fresh done cue.
+                    self.set_state(AgentState::Idle, "idle");
+                }
+            }
+            "serverRequest/resolved" => {
+                let Some(id) = params.get("requestId") else {
+                    return;
+                };
+                self.pending_requests.remove(&request_id(id));
+                if self.pending_requests.is_empty() && self.active_turn.is_some() {
+                    self.set_state(AgentState::Busy, "active");
+                }
+            }
+            "thread/closed" => self.detach("unavailable"),
+            _ => {}
+        }
+    }
+
+    fn observe_request(&mut self, id: u64, method: &str, params: &Value) {
+        if !is_user_decision(method) || !self.selected(params) {
+            return;
+        }
+        self.pending_requests.insert(id.to_string());
+        self.set_state(AgentState::NeedsInput, "needs input");
+    }
+}
+
+fn request_id(value: &Value) -> String {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| value.to_string())
+}
+
+fn is_user_decision(method: &str) -> bool {
+    matches!(
+        method,
+        "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
+            | "item/tool/requestUserInput"
+            | "applyPatchApproval"
+            | "execCommandApproval"
+    )
 }
 
 impl RequestFailure {
@@ -196,6 +461,46 @@ impl RequestFailure {
 }
 
 impl Client {
+    fn publish_live(&self) {
+        notify_observer(&self.live, &self.observer);
+    }
+
+    fn set_observer(&mut self, app: AppHandle, choreo: Choreographer) {
+        let previous = Arc::new(Mutex::new(AgentState::Idle));
+        *self.observer.lock().unwrap() = Some(Arc::new(move |snapshot| {
+            let _ = app.emit(EVENT_CODEX_STATUS, snapshot.clone());
+            if snapshot.selected_thread_id.is_none() || !snapshot.connected {
+                choreo.remove_session(CODEX_SESSION_ID);
+                return;
+            }
+            let mut previous = previous.lock().unwrap();
+            if *previous == snapshot.state {
+                return;
+            }
+            if snapshot.state == AgentState::Busy {
+                // A resumed Desktop turn was explicitly started by the user,
+                // even though its input did not originate in oTerm.
+                choreo.on_submit(&app, CODEX_SESSION_ID);
+            }
+            let cause = match snapshot.state {
+                AgentState::Busy => Signal::HookSubmit,
+                AgentState::NeedsInput => Signal::HookNotification,
+                AgentState::Done => Signal::HookStop,
+                AgentState::Idle => Signal::FullScreenExited,
+            };
+            choreo.on_state_change(
+                &app,
+                CODEX_SESSION_ID,
+                &StateChange {
+                    from: *previous,
+                    to: snapshot.state,
+                    cause,
+                },
+            );
+            *previous = snapshot.state;
+        }));
+    }
+
     fn start() -> Result<Self, String> {
         Self::start_command("codex", ["app-server", "--stdio"])
     }
@@ -231,21 +536,34 @@ impl Client {
             let _ = child.wait();
             return Err("Codex integration unavailable: stderr".into());
         };
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || read_stdout(stdout, tx));
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let orphaned = Arc::new(Mutex::new(HashMap::new()));
+        let live = Arc::new(Mutex::new(LiveState::default()));
+        let observer = Arc::new(Mutex::new(None));
+        let child = Arc::new(Mutex::new(Some(child)));
+        let stdin = Arc::new(Mutex::new(Some(stdin)));
+        thread::spawn({
+            let pending = pending.clone();
+            let orphaned = orphaned.clone();
+            let live = live.clone();
+            let observer = observer.clone();
+            let child = child.clone();
+            let stdin = stdin.clone();
+            move || pump_stdout(stdout, pending, orphaned, live, observer, child, stdin)
+        });
         thread::spawn(move || drain_stderr(stderr));
         let mut client = Self {
             child,
             stdin,
-            rx,
             next_id: 1,
-            pending: HashMap::new(),
-            notifications: VecDeque::new(),
+            pending,
+            orphaned,
             requests: VecDeque::new(),
             subscribed: None,
-            status: "connected".into(),
+            live,
+            observer,
         };
-        let init = match client.request("initialize", json!({"clientInfo":{"name":"overterm","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":false}})) {
+        let init = match client.request("initialize", json!({"clientInfo":{"name":"overterm","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":false,"optOutNotificationMethods":["item/started","item/completed","item/agentMessage/delta","item/reasoning/textDelta","item/commandExecution/outputDelta","turn/diff/updated"]}})) {
             Ok(response) => response,
             Err(error) => {
                 client.shutdown();
@@ -285,94 +603,52 @@ impl Client {
         self.requests.push_back(method.to_string());
         let id = self.next_id;
         self.next_id += 1;
-        self.write(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))?;
-        self.await_response(id)
+        let (tx, rx) = mpsc::channel();
+        if let Some(reply) = self.orphaned.lock().unwrap().remove(&id) {
+            return reply;
+        }
+        self.pending.lock().unwrap().insert(id, tx);
+        if let Err(error) =
+            self.write(json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
+        {
+            self.pending.lock().unwrap().remove(&id);
+            return Err(error);
+        }
+        self.await_response(id, rx)
     }
 
     fn write(&mut self, value: Value) -> Result<(), RequestFailure> {
-        serde_json::to_writer(&mut self.stdin, &value)
+        let mut stdin = self.stdin.lock().unwrap();
+        let Some(stdin) = stdin.as_mut() else {
+            return Err(RequestFailure::Ambiguous(
+                "Codex integration connection closed".into(),
+            ));
+        };
+        serde_json::to_writer(&mut *stdin, &value)
             .map_err(|_| RequestFailure::Ambiguous("Codex integration protocol error".into()))?;
-        self.stdin
+        stdin
             .write_all(b"\n")
-            .and_then(|_| self.stdin.flush())
+            .and_then(|_| stdin.flush())
             .map_err(|_| RequestFailure::Ambiguous("Codex integration connection closed".into()))
     }
 
-    fn await_response(&mut self, wanted: u64) -> Result<Value, RequestFailure> {
-        let deadline = Instant::now() + REQUEST_TIMEOUT;
-        loop {
-            if let Some(response) = self.pending.remove(&wanted) {
-                return response;
-            }
-            let wait = deadline.saturating_duration_since(Instant::now());
-            if wait.is_zero() {
-                return Err(RequestFailure::Ambiguous(
+    fn await_response(
+        &mut self,
+        wanted: u64,
+        rx: mpsc::Receiver<Result<Value, RequestFailure>>,
+    ) -> Result<Value, RequestFailure> {
+        match rx.recv_timeout(REQUEST_TIMEOUT) {
+            Ok(response) => response,
+            Err(RecvTimeoutError::Timeout) => {
+                self.pending.lock().unwrap().remove(&wanted);
+                Err(RequestFailure::Ambiguous(
                     "Codex integration request timed out".into(),
-                ));
+                ))
             }
-            match self.rx.recv_timeout(wait) {
-                Ok(Incoming::Response { id, result, error }) => {
-                    let reply = match (result, error) {
-                        (Some(result), None) => Ok(result),
-                        (_, Some(_)) => Err(RequestFailure::Rejected(
-                            "Codex integration request was rejected".into(),
-                        )),
-                        _ => Err(RequestFailure::Ambiguous(
-                            "Codex integration incompatible response".into(),
-                        )),
-                    };
-                    if id == wanted {
-                        return reply;
-                    }
-                    self.pending.insert(id, reply);
-                }
-                Ok(Incoming::Notification { method, params }) => {
-                    self.observe_notification(method, params)
-                }
-                Ok(Incoming::ServerRequest { method }) => {
-                    self.push_notice(format!("server request ignored: {method}"))
-                }
-                Ok(Incoming::Malformed) => {
-                    return Err(RequestFailure::Ambiguous(
-                        "Codex integration incompatible: malformed protocol frame".into(),
-                    ));
-                }
-                Ok(Incoming::Eof) => {
-                    return Err(RequestFailure::Ambiguous(
-                        "Codex integration connection closed".into(),
-                    ));
-                }
-                Err(RecvTimeoutError::Timeout) => {
-                    return Err(RequestFailure::Ambiguous(
-                        "Codex integration request timed out".into(),
-                    ));
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    return Err(RequestFailure::Ambiguous(
-                        "Codex integration connection closed".into(),
-                    ));
-                }
-            }
+            Err(RecvTimeoutError::Disconnected) => Err(RequestFailure::Ambiguous(
+                "Codex integration connection closed".into(),
+            )),
         }
-    }
-
-    fn observe_notification(&mut self, method: String, params: Value) {
-        if method == "thread/status/changed"
-            && let Some(status) = params
-                .get("status")
-                .and_then(|v| v.get("type"))
-                .and_then(Value::as_str)
-        {
-            self.status = bounded_method(status);
-        }
-        self.push_notice(method);
-    }
-
-    fn push_notice(&mut self, value: String) {
-        if self.notifications.len() == 12 {
-            self.notifications.pop_front();
-        }
-        self.notifications.push_back(value);
     }
 
     fn list(&mut self) -> Result<Vec<ThreadSummary>, RequestFailure> {
@@ -400,12 +676,19 @@ impl Client {
         if let Some(current) = self.subscribed.clone() {
             self.request("thread/unsubscribe", json!({"threadId":current}))?;
             self.subscribed = None;
-            self.status = "connected".into();
+            self.live.lock().unwrap().detach("connected");
+            self.publish_live();
         }
         self.request("thread/read", json!({"threadId":id,"includeTurns":false}))?;
-        self.request("thread/resume", json!({"threadId":id,"excludeTurns":true}))?;
+        self.live.lock().unwrap().select(id);
+        if let Err(error) =
+            self.request("thread/resume", json!({"threadId":id,"excludeTurns":true}))
+        {
+            self.live.lock().unwrap().detach("unavailable");
+            self.publish_live();
+            return Err(error);
+        }
         self.subscribed = Some(id.to_string());
-        self.status = "subscribed".into();
         Ok(())
     }
 
@@ -413,32 +696,40 @@ impl Client {
         if let Some(id) = self.subscribed.clone() {
             self.request("thread/unsubscribe", json!({"threadId":id}))?;
             self.subscribed = None;
-            self.status = "connected".into();
+            self.live.lock().unwrap().detach("disconnected");
+            self.publish_live();
         }
         Ok(())
     }
 
     fn shutdown(mut self) {
         let _ = self.detach();
-        drop(self.stdin);
+        self.close_owned();
+    }
+
+    fn close_owned(&mut self) {
+        self.stdin.lock().unwrap().take();
+        let Some(mut child) = self.child.lock().unwrap().take() else {
+            return;
+        };
         let deadline = Instant::now() + EXIT_GRACE;
         while Instant::now() < deadline {
-            match self.child.try_wait() {
+            match child.try_wait() {
                 Ok(Some(_)) | Err(_) => return,
                 Ok(None) => thread::sleep(Duration::from_millis(25)),
             }
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// Close the transport without attempting another RPC. This is required
     /// when a request outcome is ambiguous: the server may already have
     /// applied it, so connection closure is the only safe subscription reset.
     fn invalidate(mut self) {
-        drop(self.stdin);
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.live.lock().unwrap().detach("unavailable");
+        self.publish_live();
+        self.close_owned();
     }
 }
 
@@ -493,6 +784,13 @@ fn with_client<T>(
         .0
         .lock()
         .map_err(|_| "Codex integration unavailable".to_string())?;
+    if guard
+        .as_ref()
+        .is_some_and(|client| !client.live.lock().unwrap().connected)
+        && let Some(client) = guard.take()
+    {
+        client.invalidate();
+    }
     if guard.is_none() {
         *guard = Some(Client::start()?);
     }
@@ -519,13 +817,50 @@ pub fn codex_list_threads(
 #[tauri::command]
 pub fn codex_attach_thread(
     thread_id: String,
+    app: AppHandle,
     sessions: State<'_, CodexSessions>,
+    choreo: State<'_, Choreographer>,
 ) -> Result<(), String> {
-    with_client(&sessions, |client| client.attach(&thread_id))
+    let live = with_client(&sessions, |client| {
+        client.set_observer(app.clone(), choreo.inner().clone());
+        client.attach(&thread_id)?;
+        Ok(client.live.clone())
+    })?;
+    let live_for_check = live.clone();
+    choreo.add_session(
+        &app,
+        CODEX_SESSION_ID,
+        Arc::new(move || live_for_check.lock().unwrap().state == AgentState::Busy),
+    );
+    let snapshot = live.lock().unwrap().snapshot();
+    if snapshot.state != AgentState::Idle {
+        if snapshot.state == AgentState::Busy {
+            choreo.on_submit(&app, CODEX_SESSION_ID);
+        }
+        let cause = match snapshot.state {
+            AgentState::Busy => Signal::HookSubmit,
+            AgentState::NeedsInput => Signal::HookNotification,
+            AgentState::Done => Signal::HookStop,
+            AgentState::Idle => Signal::FullScreenExited,
+        };
+        choreo.on_state_change(
+            &app,
+            CODEX_SESSION_ID,
+            &StateChange {
+                from: AgentState::Idle,
+                to: snapshot.state,
+                cause,
+            },
+        );
+    }
+    Ok(())
 }
 
 #[tauri::command]
-pub fn codex_detach(sessions: State<'_, CodexSessions>) -> Result<(), String> {
+pub fn codex_detach(
+    sessions: State<'_, CodexSessions>,
+    choreo: State<'_, Choreographer>,
+) -> Result<(), String> {
     let mut guard = sessions
         .0
         .lock()
@@ -533,6 +868,7 @@ pub fn codex_detach(sessions: State<'_, CodexSessions>) -> Result<(), String> {
     if let Some(client) = guard.take() {
         client.shutdown();
     }
+    choreo.remove_session(CODEX_SESSION_ID);
     Ok(())
 }
 
@@ -543,17 +879,32 @@ pub fn codex_status(sessions: State<'_, CodexSessions>) -> CodexStatus {
     };
     guard
         .as_ref()
-        .map(|client| CodexStatus {
-            available: true,
-            connected: true,
-            subscribed_thread_id: client.subscribed.clone(),
-            thread_status: client.status.clone(),
-            detail: if client.subscribed.is_some() {
-                format!("Read-only attachment active ({})", client.status)
-            } else {
-                "Connected; choose a thread".into()
-            },
-            notifications: client.notifications.iter().cloned().collect(),
+        .map(|client| {
+            let live = client.live.lock().unwrap();
+            CodexStatus {
+                available: true,
+                connected: live.connected,
+                subscribed_thread_id: client
+                    .subscribed
+                    .clone()
+                    .filter(|_| live.selected.is_some()),
+                thread_status: match live.state {
+                    AgentState::Idle => "idle",
+                    AgentState::Busy => "busy",
+                    AgentState::NeedsInput => "needsInput",
+                    AgentState::Done => "done",
+                }
+                .into(),
+                detail: if live.selected.is_some() {
+                    format!("Read-only attachment {}", live.cause)
+                } else if live.connected {
+                    "Connected; choose a thread".into()
+                } else {
+                    "Codex attachment unavailable".into()
+                },
+                cause: live.cause.clone(),
+                notifications: Vec::new(),
+            }
         })
         .unwrap_or_default()
 }
@@ -619,7 +970,7 @@ mod tests {
         let request =
             classify(json!({"id":2,"method":"approval/request","params":{"secret":"ignored"}}));
         assert!(
-            matches!(request, Incoming::ServerRequest { method } if method == "approval/request")
+            matches!(request, Incoming::ServerRequest { method, .. } if method == "approval/request")
         );
     }
 
@@ -649,12 +1000,7 @@ mod tests {
         assert_eq!(threads[0].workspace.as_deref(), Some("project"));
         client.attach("fixture").expect("metadata-only resume");
         assert_eq!(client.subscribed.as_deref(), Some("fixture"));
-        assert!(
-            client
-                .notifications
-                .iter()
-                .any(|method| method == "thread/status/changed")
-        );
+        assert_eq!(client.live.lock().unwrap().state, AgentState::Idle);
         client.detach().expect("unsubscribe");
         assert!(client.subscribed.is_none());
         client.shutdown();
@@ -730,6 +1076,83 @@ mod tests {
         client.shutdown();
     }
 
+    #[test]
+    fn live_state_scopes_and_sanitizes_selected_thread_events() {
+        let mut live = LiveState::default();
+        live.select("A");
+        live.observe_notification(
+            "turn/started",
+            &json!({"threadId":"B","turn":{"id":"other"}}),
+        );
+        assert_eq!(live.state, AgentState::Idle);
+        live.observe_notification(
+            "turn/started",
+            &json!({"threadId":"A","turn":{"id":"turn-a"}}),
+        );
+        assert_eq!(live.state, AgentState::Busy);
+        live.observe_notification(
+            "thread/status/changed",
+            &json!({"threadId":"A","status":{"type":"active","activeFlags":["waitingOnApproval"]}}),
+        );
+        assert_eq!(live.state, AgentState::NeedsInput);
+        live.observe_notification("turn/completed", &json!({"threadId":"B","turn":{"id":"other","status":"failed","error":{"message":"secret"}}}));
+        assert_eq!(live.state, AgentState::NeedsInput);
+        for status in ["completed", "interrupted", "failed"] {
+            live.observe_notification("turn/completed", &json!({"threadId":"A","turn":{"id":"turn-a","status":status,"error":{"message":"secret"}}}));
+            assert_eq!(live.state, AgentState::Done);
+            assert_eq!(live.cause, status);
+            live.select("A");
+        }
+        let snapshot = live.snapshot();
+        let rendered = serde_json::to_string(&snapshot).unwrap();
+        assert!(!rendered.contains("secret"));
+        assert!(!rendered.contains("command"));
+    }
+
+    #[test]
+    fn pending_user_decisions_require_matching_resolution() {
+        let mut live = LiveState::default();
+        live.select("A");
+        let sensitive = json!({"threadId":"A","turnId":"turn-a","command":"secret","cwd":"/private/path","body":"hidden"});
+        live.observe_request(7, "item/commandExecution/requestApproval", &sensitive);
+        live.observe_request(8, "item/tool/requestUserInput", &sensitive);
+        assert_eq!(live.state, AgentState::NeedsInput);
+        assert_eq!(live.pending_requests.len(), 2);
+        live.active_turn = Some("turn-a".into());
+        live.observe_notification(
+            "serverRequest/resolved",
+            &json!({"threadId":"A","requestId":7}),
+        );
+        assert_eq!(live.state, AgentState::NeedsInput);
+        live.observe_notification(
+            "serverRequest/resolved",
+            &json!({"threadId":"B","requestId":8}),
+        );
+        assert_eq!(live.state, AgentState::NeedsInput);
+        live.observe_notification(
+            "serverRequest/resolved",
+            &json!({"threadId":"A","requestId":8}),
+        );
+        assert_eq!(live.state, AgentState::Busy);
+        assert!(live.pending_requests.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pump_observes_notification_while_no_request_is_pending() {
+        let script = concat!(
+            "printf '%s\\n' '{\"id\":1,\"result\":{\"platformOs\":\"linux\"}}'; ",
+            "read _; read _; printf '%s\\n' '{\"id\":2,\"result\":{}}'; ",
+            "read _; printf '%s\\n' '{\"id\":3,\"result\":{}}'; ",
+            "sleep 0.1; printf '%s\\n' '{\"method\":\"turn/started\",\"params\":{\"threadId\":\"A\",\"turn\":{\"id\":\"turn-a\"}}}'; sleep 10"
+        );
+        let mut client = Client::start_command("/bin/sh", ["-c", script]).expect("handshake");
+        client.attach("A").expect("attach");
+        thread::sleep(Duration::from_millis(250));
+        assert_eq!(client.live.lock().unwrap().state, AgentState::Busy);
+        client.shutdown();
+    }
+
     #[cfg(unix)]
     #[test]
     fn ambiguous_resume_timeout_invalidates_session_and_reaps_child() {
@@ -748,7 +1171,7 @@ mod tests {
             marker.display()
         );
         let client = Client::start_command("/bin/sh", ["-c", &script]).expect("handshake");
-        let child_pid = client.child.id();
+        let child_pid = client.child.lock().unwrap().as_ref().unwrap().id();
         let sessions = CodexSessions(Arc::new(Mutex::new(Some(client))));
         with_client(&sessions, |client| client.attach("A")).expect("attach A");
         let started = Instant::now();
@@ -865,13 +1288,7 @@ mod tests {
             "'{\"id\":1,\"result\":{\"platformOs\":\"linux\"}}'; read _; sleep 10"
         );
         let client = Client::start_command("/bin/sh", ["-c", script]).expect("handshake");
-        assert!(client.pending.contains_key(&99));
-        assert!(
-            client
-                .notifications
-                .iter()
-                .any(|event| event == "future/event")
-        );
+        assert!(client.orphaned.lock().unwrap().contains_key(&99));
         client.shutdown();
     }
 }

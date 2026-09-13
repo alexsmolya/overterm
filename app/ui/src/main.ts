@@ -117,7 +117,8 @@ const tabAdd = document.getElementById('tab-add') as HTMLButtonElement;
 const codexOpen = document.getElementById('codex-open') as HTMLButtonElement;
 
 type CodexThread = { id: string; title: string; workspace: string | null; updatedAt: number | null; status: string };
-type CodexStatus = { available: boolean; connected: boolean; subscribedThreadId: string | null; threadStatus: string; detail: string };
+type CodexStatus = { available: boolean; connected: boolean; subscribedThreadId: string | null; threadStatus: string; detail: string; cause: string };
+type CodexLive = { selectedThreadId: string | null; state: AgentState; cause: string; connected: boolean };
 
 /// Read one palette value out of the stylesheet.
 ///
@@ -268,9 +269,6 @@ async function refreshCodex() {
 
 function openCodex() { codexSheet.hidden = false; void refreshCodex(); }
 function closeCodex() {
-  // Closing this read-only view ends the owned attachment rather than leaving
-  // a background Codex child behind after the user can no longer inspect it.
-  void invoke('codex_detach');
   codexSheet.hidden = true;
 }
 codexOpen.addEventListener('click', openCodex);
@@ -279,6 +277,13 @@ codexOpen.addEventListener('click', openCodex);
 codexDetach.addEventListener('click', async () => {
   try { await invoke('codex_detach'); codexNote.textContent = 'Detached.'; codexDetach.hidden = true; }
   catch { codexNote.textContent = 'Codex could not detach cleanly.'; }
+});
+
+void listen<CodexLive>('overterm://codex-status', ({ payload }) => {
+  const label = payload.connected ? stateLabels[payload.state] : 'unavailable';
+  codexOpen.title = `Codex: ${label}`;
+  codexNote.textContent = payload.connected ? `Read-only attachment ${label}.` : 'Codex attachment unavailable.';
+  codexDetach.hidden = !payload.selectedThreadId;
 });
 
 function setAgentState(session: Session, state: AgentState, cause: string) {
