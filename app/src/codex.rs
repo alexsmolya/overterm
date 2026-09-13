@@ -1256,7 +1256,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn eof_and_timeout_are_controlled_errors() {
-        let eof = match Client::start_command("/bin/sh", ["-c", "exit 7"]) {
+        let eof = match Client::start_command("/bin/sh", ["-c", "read _; exit 7"]) {
             Ok(client) => {
                 client.shutdown();
                 panic!("server exited before initialize");
