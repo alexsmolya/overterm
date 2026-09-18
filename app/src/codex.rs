@@ -1162,7 +1162,10 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&marker);
         let script = format!(
-            "printf '%s\\n' '{{\"id\":1,\"result\":{{\"platformOs\":\"linux\"}}}}'; \\
+            // Gate the initialization response on consuming the request so the
+            // fixture cannot race Client::start_command with an unsolicited
+            // response before the request/pump handshake is established.
+            "read _; printf '%s\\n' '{{\"id\":1,\"result\":{{\"platformOs\":\"linux\"}}}}'; \\
              read _; read _; printf '%s\\n' '{{\"id\":2,\"result\":{{\"thread\":{{\"id\":\"A\"}}}}}}'; \\
              read _; printf '%s\\n' '{{\"id\":3,\"result\":{{\"thread\":{{\"id\":\"A\"}}}}}}'; \\
              read _; printf '%s\\n' '{{\"id\":4,\"result\":{{}}}}'; \\
