@@ -22,6 +22,7 @@ use crate::choreograph::Choreographer;
 use threads::ThreadSummary;
 
 /// What a Codex tab is told, on the channel it opened the thread with.
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Clone, serde::Serialize)]
 #[serde(tag = "event", content = "data", rename_all = "camelCase")]
 pub enum CodexEvent {
@@ -450,7 +451,7 @@ pub use live::Sessions as CodexSessions;
 /// Only the socket is spoken so far.
 #[cfg(not(unix))]
 #[derive(Default)]
-pub struct CodexSessions;
+pub struct CodexSessions {}
 
 #[cfg(not(unix))]
 impl CodexSessions {
