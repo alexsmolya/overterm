@@ -2520,6 +2520,7 @@ dependencies = [
  "tauri-plugin-global-shortcut",
  "tauri-plugin-opener",
  "toml 1.1.4+spec-1.1.0",
+ "uuid",
 ]
 
 [[package]]
