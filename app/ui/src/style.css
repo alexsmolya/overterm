@@ -346,6 +346,38 @@ body.attention-needs::after {
   cursor: pointer;
 }
 
+/* Opens a thread from the Codex desktop app. Its mark is muted until
+   hovered, so it reads as a control next to the + rather than as a tab. */
+#codex-add {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-tile);
+  background: none;
+  cursor: pointer;
+}
+
+#codex-add svg {
+  width: 17px;
+  height: 17px;
+  opacity: 0.45;
+  filter: grayscale(1);
+}
+
+#codex-add:hover {
+  background: var(--line);
+}
+
+#codex-add:hover svg {
+  opacity: 1;
+  filter: none;
+}
+
 #tab-add:hover,
 .tab:not(.active):hover {
   color: var(--ink-2);
@@ -661,7 +693,8 @@ body.state-busy .pill .dot {
 
 /* Settings sheet. Covers the terminal rather than resizing it, so the
    agent's TUI is not reflowed by opening a preferences panel. */
-#settings {
+#settings,
+#codex-picker {
   position: fixed;
   inset: 0;
   z-index: 30;
@@ -673,11 +706,13 @@ body.state-busy .pill .dot {
   background: var(--scrim);
 }
 
-#settings[hidden] {
+#settings[hidden],
+#codex-picker[hidden] {
   display: none;
 }
 
-#settings .sheet {
+#settings .sheet,
+#codex-picker .sheet {
   display: flex;
   flex-direction: column;
   width: 100%;
@@ -688,6 +723,43 @@ body.state-busy .pill .dot {
   background: var(--chrome);
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
   overflow: hidden;
+}
+
+#codex-thread-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.codex-thread {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 9px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: var(--body);
+  color: var(--ink);
+  font: 500 12px/1.3 var(--mono);
+  text-align: left;
+  cursor: pointer;
+}
+
+.codex-thread:hover {
+  border-color: var(--ink-4);
+}
+
+.codex-thread-title {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.codex-thread-meta {
+  color: var(--ink-3);
+  font-size: 10.5px;
+  font-weight: 400;
 }
 
 .sheet-head {
@@ -808,6 +880,7 @@ body.mode-bar #workspace,
 body.mode-bar #titlebar,
 body.mode-bar #find,
 body.mode-bar #settings,
+body.mode-bar #codex-picker,
 body.mode-bar #first-run {
   display: none;
 }
@@ -1105,4 +1178,325 @@ body.mode-bar #grips {
 /* The one button that cannot be undone gets the strongest hover. */
 .icon.close:hover {
   background: var(--busy-pill);
+}
+
+/* A Codex thread as a chat. Same surface as a terminal pane, so switching
+   tabs does not flash a different background. */
+.codex-pane {
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  font: 400 var(--chat-font-size, 13px) / 1.5 var(--mono);
+  color: var(--ink);
+}
+
+.codex-pane[hidden] {
+  display: none;
+}
+
+.codex-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+}
+
+.codex-mark svg {
+  display: block;
+  width: 16px;
+  height: 16px;
+}
+
+.codex-title {
+  flex: none;
+  max-width: 60%;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-weight: 500;
+}
+
+.codex-cwd {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--ink-3);
+  font-size: 11px;
+}
+
+.codex-problem {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 12px;
+  background: var(--needs-pill);
+  color: var(--needs-ink);
+  font-size: 11.5px;
+}
+
+.codex-problem[hidden] {
+  display: none;
+}
+
+.codex-problem span {
+  flex: 1;
+}
+
+.codex-problem button,
+.codex-approval-actions button,
+.codex-send {
+  flex: none;
+  padding: 5px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: var(--chrome);
+  color: var(--ink);
+  font: 500 11.5px/1 var(--mono);
+  cursor: pointer;
+}
+
+.codex-problem button:hover,
+.codex-approval-actions button:hover,
+.codex-send:hover {
+  border-color: var(--ink-4);
+}
+
+.codex-log {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px 14px 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.codex-empty,
+.codex-working {
+  margin: 0;
+  color: var(--ink-3);
+  font-size: 12px;
+}
+
+.codex-empty[hidden],
+.codex-working[hidden] {
+  display: none;
+}
+
+.codex-item {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.codex-item.user {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.codex-bubble {
+  max-width: 85%;
+  padding: 7px 11px;
+  border-radius: 12px 12px 3px 12px;
+  background: var(--chrome);
+  box-shadow: 0 0 0 1px var(--line);
+  white-space: pre-wrap;
+}
+
+.codex-text {
+  white-space: pre-wrap;
+}
+
+.codex-item.agent {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* Progress notes Codex writes while it works, dimmer than the answer. */
+.codex-item.agent.commentary {
+  color: var(--ink-2);
+}
+
+.codex-code,
+.codex-output pre {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: var(--radius-control);
+  background: var(--chrome);
+  box-shadow: 0 0 0 1px var(--line);
+  font: inherit;
+  font-size: 0.92em;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.codex-output pre {
+  margin-top: 6px;
+  max-height: 260px;
+  overflow-y: auto;
+  color: var(--ink-2);
+}
+
+.codex-command-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+  font-size: 0.92em;
+}
+
+.codex-output summary {
+  list-style: none;
+  cursor: pointer;
+}
+
+.codex-output summary::-webkit-details-marker {
+  display: none;
+}
+
+/* The only sign a command line opens: a caret after its status. */
+.codex-output summary .codex-status::after {
+  content: ' \25B8';
+}
+
+.codex-output[open] summary .codex-status::after {
+  content: ' \25BE';
+}
+
+.codex-command {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  color: var(--ink-2);
+  font: inherit;
+}
+
+.codex-command::before {
+  content: '$ ';
+  color: var(--ink-4);
+}
+
+.codex-output[open] .codex-command {
+  white-space: pre-wrap;
+}
+
+.codex-files {
+  flex: 1;
+  color: var(--ink-2);
+}
+
+.codex-status {
+  flex: none;
+  color: var(--ink-3);
+  font-size: 0.9em;
+}
+
+.codex-status.status-inProgress {
+  color: var(--busy-ink);
+}
+
+.codex-status.status-declined,
+.codex-status.status-failed {
+  color: var(--needs-ink);
+}
+
+.codex-paths {
+  margin: 4px 0 0;
+  padding-left: 18px;
+  color: var(--ink-3);
+  font-size: 0.9em;
+}
+
+.codex-item.note {
+  color: var(--ink-3);
+  font-size: 0.9em;
+}
+
+/* Waiting on the user, in the same amber as the needs-input state. */
+.codex-approval {
+  flex: none;
+  margin: 0 14px 8px;
+  padding: 10px 12px;
+  border-radius: var(--radius-tile);
+  background: var(--needs-pill);
+  box-shadow: 0 0 0 1px var(--needs-ring);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.codex-approval[hidden] {
+  display: none;
+}
+
+.codex-approval-title {
+  font-weight: 600;
+  color: var(--needs-ink);
+}
+
+.codex-approval-reason {
+  margin: 0;
+  color: var(--ink-2);
+}
+
+.codex-approval-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.codex-approval-actions .approve {
+  border-color: var(--done);
+  color: var(--done-ink);
+}
+
+.codex-approval-actions button:disabled,
+.codex-send:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.codex-composer {
+  flex: none;
+  padding: 8px 14px 10px;
+  border-top: 1px solid var(--line);
+}
+
+.codex-composer-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+
+.codex-composer textarea {
+  flex: 1;
+  min-width: 0;
+  max-height: 160px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: var(--chrome);
+  color: var(--ink);
+  font: inherit;
+  resize: none;
+  field-sizing: content;
+}
+
+.codex-composer textarea:focus {
+  outline: none;
+  border-color: var(--ink-4);
+}
+
+.codex-hint {
+  margin-top: 5px;
+  color: var(--ink-4);
+  font-size: 10.5px;
 }

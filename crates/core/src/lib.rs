@@ -4,6 +4,7 @@
 //! window-specific belongs in the app crate behind its platform module.
 
 pub mod choreo;
+pub mod codex;
 pub mod detect;
 pub mod session;
 

@@ -23,6 +23,9 @@ toml = "1"
 regex = "1"
 serde.workspace = true
 serde_json.workspace = true
+# Request ids on the Codex desktop bus are shared with every other
+# client, so they have to be unique rather than just counted.
+uuid.workspace = true
 # Hands a URL to the user's browser. Without it a link clicked in the
 # terminal navigates the webview itself and the app becomes a browser.
 tauri-plugin-opener = "2.5.4"

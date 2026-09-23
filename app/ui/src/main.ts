@@ -32,6 +32,7 @@ import { WebLinksAddon } from '@xterm/addon-web-links';
 import { WebglAddon } from '@xterm/addon-webgl';
 import '@xterm/xterm/css/xterm.css';
 import './style.css';
+import { CodexChat, shortPath, type ThreadView } from './codex';
 
 type AgentState = 'idle' | 'busy' | 'needsInput' | 'done';
 type WindowMode = 'bar' | 'panel';
@@ -95,15 +96,12 @@ type Settings = {
 const FONT_SIZES = [9, 10, 11, 12, 13, 14, 16, 18, 20, 24];
 const DEFAULT_FONT_SIZE = 13;
 
-/// One terminal in the window, with everything that belongs to it.
+/// One tab in the window, with everything that belongs to it.
 ///
 /// Every field here used to be a module-level variable, which is exactly
 /// why the window could only hold one session.
-type Session = {
+type SessionBase = {
   id: string;
-  term: Terminal;
-  fit: FitAddon;
-  search: SearchAddon;
   pane: HTMLDivElement;
   tab: HTMLButtonElement;
   state: AgentState;
@@ -120,9 +118,26 @@ type Session = {
   /// be read back, so this follows the keystrokes we sent it. It is what
   /// lets a prompt started in the full terminal show up in the bar, and
   /// the other way round. Per session, because two agents have two
-  /// half-written prompts.
+  /// half-written prompts. A Codex tab keeps its composer's text here.
   pending: string;
 };
+
+type TerminalSession = SessionBase & {
+  kind: 'terminal';
+  term: Terminal;
+  fit: FitAddon;
+  search: SearchAddon;
+};
+
+/// A thread owned by the Codex desktop app, shown as a chat rather than a
+/// terminal. Everything about the window treats it like any other tab.
+type CodexSession = SessionBase & {
+  kind: 'codex';
+  threadId: string;
+  chat: CodexChat;
+};
+
+type Session = TerminalSession | CodexSession;
 
 const sessions: Session[] = [];
 /// The session on screen. Null only before the first one has started.
@@ -131,6 +146,25 @@ let active: Session | null = null;
 const terminalsEl = document.getElementById('terminals') as HTMLDivElement;
 const tabsEl = document.getElementById('tabs') as HTMLElement;
 const tabAdd = document.getElementById('tab-add') as HTMLButtonElement;
+
+function terminals(): TerminalSession[] {
+  return sessions.filter((s): s is TerminalSession => s.kind === 'terminal');
+}
+
+/// The active tab if it is a terminal. Find, zoom, copy and clear only mean
+/// something there.
+function activeTerminal(): TerminalSession | null {
+  return active?.kind === 'terminal' ? active : null;
+}
+
+function fitActive() {
+  activeTerminal()?.fit.fit();
+}
+
+function focusActive() {
+  if (active?.kind === 'codex') active.chat.focus();
+  else active?.term.focus();
+}
 
 /// Read one palette value out of the stylesheet.
 ///
@@ -279,7 +313,7 @@ function applyMode(next: WindowMode) {
   if (next === 'panel') {
     // The pane was display:none, so it has to be measured again before
     // xterm can lay anything out.
-    requestAnimationFrame(() => active?.fit.fit());
+    requestAnimationFrame(fitActive);
   } else {
     // Nothing to search once the terminal is off screen, and leaving it
     // open means it comes back with a stale query on the next expand.
@@ -291,7 +325,7 @@ function applyMode(next: WindowMode) {
   // window already had focus, so nothing is taken from the app the user
   // is actually working in.
   if (document.hasFocus()) {
-    if (next === 'panel') active?.term.focus();
+    if (next === 'panel') focusActive();
     else barInput.focus();
   }
   render();
@@ -299,7 +333,7 @@ function applyMode(next: WindowMode) {
 
 function requestMode(next: WindowMode) {
   invoke('set_window_mode', { mode: next }).catch(() => {});
-  if (next === 'panel') active?.term.focus();
+  if (next === 'panel') focusActive();
   else barInput.focus();
 }
 
@@ -330,6 +364,7 @@ listen<{ mode: WindowMode }>('overterm://mode', (event) => applyMode(event.paylo
 window.addEventListener('keydown', (event) => {
   if (event.key !== 'Escape') return;
   if (!settingsSheet.hidden) closeSettings();
+  else if (!codexPicker.hidden) closeCodexPicker();
   else if (!findBox.hidden) closeFind();
 });
 
@@ -341,7 +376,7 @@ window.addEventListener('keydown', (event) => {
 /// columns. Refitting is what tells the program on the other end to
 /// redraw itself narrower instead of wrapping at the old width.
 function zoom(steps: number) {
-  const size = active?.term.options.fontSize ?? DEFAULT_FONT_SIZE;
+  const size = settings?.terminal.font_size ?? DEFAULT_FONT_SIZE;
   // Nearest step rather than an exact match, so a size typed into the
   // settings sheet still zooms from where it is instead of jumping.
   let from = 0;
@@ -359,10 +394,11 @@ function resetZoom() {
 /// Resize the terminal and remember it, so a zoom survives a relaunch
 /// rather than being undone by the stored size on the next start.
 function setFontSize(size: number) {
-  for (const session of sessions) {
+  for (const session of terminals()) {
     session.term.options.fontSize = size;
   }
-  active?.fit.fit();
+  document.documentElement.style.setProperty('--chat-font-size', `${size}px`);
+  fitActive();
   if (settings && settings.terminal.font_size !== size) {
     settings = { ...settings, terminal: { ...settings.terminal, font_size: size } };
     persist(settings);
@@ -375,7 +411,7 @@ function setFontSize(size: number) {
 /// webview to copy on its own. Without this, Cmd+C over a selection does
 /// nothing at all.
 function copySelection(): boolean {
-  const selection = active?.term.getSelection();
+  const selection = activeTerminal()?.term.getSelection();
   if (!selection) return false;
   navigator.clipboard.writeText(selection).catch(() => {});
   return true;
@@ -398,6 +434,8 @@ function paste() {
 // Right-click pastes, the way it does in a terminal rather than the way
 // it does in a browser.
 terminalsEl.addEventListener('contextmenu', (event: MouseEvent) => {
+  // A chat is ordinary text, so it keeps the webview's own menu.
+  if (!activeTerminal()) return;
   event.preventDefault();
   paste();
 });
@@ -429,7 +467,7 @@ function findDecorations() {
 }
 
 function runFind(direction: 'next' | 'previous') {
-  const search = active?.search;
+  const search = activeTerminal()?.search;
   if (!search) return;
   const query = findInput.value;
   if (!query) {
@@ -445,6 +483,7 @@ function runFind(direction: 'next' | 'previous') {
 
 function openFind() {
   if (mode !== 'panel') return; // the terminal is not on screen in the bar
+  if (!activeTerminal()) return; // a chat has no canvas to search
   findBox.hidden = false;
   findInput.select();
   findInput.focus();
@@ -452,9 +491,9 @@ function openFind() {
 
 function closeFind() {
   findBox.hidden = true;
-  active?.search.clearDecorations();
+  activeTerminal()?.search.clearDecorations();
   findBox.classList.remove('no-matches');
-  active?.term.focus();
+  focusActive();
 }
 
 findInput.addEventListener('input', () => runFind('next'));
@@ -566,7 +605,7 @@ function applyTheme(choice: Theme) {
         : `Switch to ${shown === 'light' ? 'dark' : 'light'} (right-click to follow the system)`;
   }
 
-  for (const session of sessions) {
+  for (const session of terminals()) {
     session.term.options.theme = {
       background: token('--body'),
       foreground: token('--ink'),
@@ -674,12 +713,13 @@ function showSettings(current: Settings) {
 /// be measured again and the new size passed to the program running in
 /// it. Without that it keeps drawing to the old width and wraps.
 function applyTerminalSettings(current: Settings) {
-  for (const session of sessions) {
+  for (const session of terminals()) {
     session.term.options.fontFamily = current.terminal.font_family;
     session.term.options.fontSize = current.terminal.font_size;
     session.term.options.scrollback = current.terminal.scrollback;
   }
-  if (mode === 'panel') active?.fit.fit();
+  document.documentElement.style.setProperty('--chat-font-size', `${current.terminal.font_size}px`);
+  if (mode === 'panel') fitActive();
 }
 
 /// Send the whole settings object and adopt whatever comes back.
@@ -1018,7 +1058,7 @@ function openSettings() {
 
 function closeSettings() {
   settingsSheet.hidden = true;
-  active?.term.focus();
+  focusActive();
 }
 
 for (const button of settingsButtons) {
@@ -1094,7 +1134,7 @@ const NEWLINE = '\x1b\r';
 /// come from the tab whose program asked, which is not always the tab
 /// being looked at, and sending them to the active one types them into
 /// somebody else's shell.
-function write(session: Session, data: string) {
+function write(session: TerminalSession, data: string) {
   // A session that has not finished spawning has no id to write to.
   if (!session.id) return;
   invoke('write_pty', { sessionId: session.id, data }).catch(() => {});
@@ -1104,7 +1144,8 @@ function write(session: Session, data: string) {
 /// Send bytes to the tab on screen. Everything the user types is this,
 /// since only the visible terminal can have the keyboard.
 function writeActive(data: string) {
-  if (active) write(active, data);
+  const terminal = activeTerminal();
+  if (terminal) write(terminal, data);
 }
 
 function track(session: Session, data: string) {
@@ -1136,13 +1177,20 @@ function track(session: Session, data: string) {
 /// The bar is one line tall, so a draft with breaks in it is shown with
 /// them marked rather than flattened away.
 function showDraft() {
-  barInput.value = (active?.pending ?? '').replace(/\n/g, ' \u21b5 ');
+  barInput.value = (active?.pending ?? '').replace(/\n/g, BAR_BREAK);
 }
+
+/// How a line break in a draft is drawn in the one-line bar.
+const BAR_BREAK = ' \u21b5 ';
 
 // The bar input forwards keystrokes rather than submitting its contents.
 // What is showing is already in the program's own buffer, so sending the
 // whole box on Enter would send it twice.
 barInput.addEventListener('keydown', (event) => {
+  if (active?.kind === 'codex') {
+    codexBarKey(active, event);
+    return;
+  }
   if (event.metaKey || event.altKey) return;
   if (event.ctrlKey) {
     if (event.key === 'c') writeActive('\x03');
@@ -1169,7 +1217,27 @@ barInput.addEventListener('keydown', (event) => {
   event.preventDefault();
 });
 
+/// In a Codex tab the bar is an ordinary text box holding the same draft as
+/// the composer: there is no program on the other end reading keystrokes,
+/// so the whole message goes when Enter is pressed.
+function codexBarKey(session: CodexSession, event: KeyboardEvent) {
+  if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+    event.preventDefault();
+    void session.chat.submit();
+  } else if (event.key === 'Escape') {
+    event.preventDefault();
+    if (session.chat.isWorking()) interruptCodex(session);
+  }
+}
+
+barInput.addEventListener('input', () => {
+  if (active?.kind !== 'codex') return;
+  active.pending = barInput.value.split(BAR_BREAK).join('\n');
+  active.chat.draft = active.pending;
+});
+
 barInput.addEventListener('paste', (event) => {
+  if (active?.kind === 'codex') return; // the text box takes it as typed
   event.preventDefault();
   const text = event.clipboardData?.getData('text');
   if (text) writeActive(text);
@@ -1214,7 +1282,7 @@ function handleTerminalKey(event: KeyboardEvent): boolean {
       // rather than swallow it.
       return copySelection() ? claimKey(event) : true;
     case 'k':
-      active?.term.clear();
+      activeTerminal()?.term.clear();
       return claimKey(event);
     case '=':
     case '+':
@@ -1291,8 +1359,8 @@ function activate(session: Session) {
   // The pane was display:none until a moment ago, so it has no measured
   // size yet and fitting it now would reflow the agent's TUI to nothing.
   requestAnimationFrame(() => {
-    session.fit.fit();
-    if (mode === 'panel' && document.hasFocus()) session.term.focus();
+    fitActive();
+    if (mode === 'panel' && document.hasFocus()) focusActive();
   });
   // The bar shows one session's draft and one session's output line.
   showDraft();
@@ -1304,7 +1372,7 @@ function activate(session: Session) {
 /// Answers with the session, so a caller with something to run in it can
 /// write to it once it exists. Nothing when the spawn failed, which the
 /// terminal itself has already said.
-async function addSession(): Promise<Session | null> {
+async function addSession(): Promise<TerminalSession | null> {
   const { term, fit, search } = newTerminal();
 
   const pane = document.createElement('div');
@@ -1319,7 +1387,8 @@ async function addSession(): Promise<Session | null> {
 
   term.open(pane);
 
-  const session: Session = {
+  const session: TerminalSession = {
+    kind: 'terminal',
     id: '',
     term,
     fit,
@@ -1386,17 +1455,194 @@ async function addSession(): Promise<Session | null> {
 /// terminal in it has nothing to show and no way back.
 function closeSession(session: Session) {
   if (sessions.length <= 1) return;
-  if (session.id) invoke('kill_session', { sessionId: session.id }).catch(() => {});
+  if (session.kind === 'terminal') {
+    if (session.id) invoke('kill_session', { sessionId: session.id }).catch(() => {});
+    session.term.dispose();
+  } else {
+    invoke('codex_close', { threadId: session.threadId }).catch(() => {});
+  }
   const index = sessions.indexOf(session);
   sessions.splice(index, 1);
   session.tab.remove();
   session.pane.remove();
-  session.term.dispose();
   if (active === session) {
     active = null;
     activate(sessions[Math.min(index, sessions.length - 1)]);
   }
   render();
+}
+
+// --- Codex threads ---------------------------------------------------
+
+type CodexThread = { id: string; title: string; workspace: string | null; updatedAt: number | null };
+
+type CodexEvent =
+  | { event: 'view'; data: ThreadView }
+  | { event: 'agentStateChanged'; data: { state: AgentState; cause: string } }
+  | { event: 'problem'; data: { message: string | null } };
+
+const codexAdd = document.getElementById('codex-add') as HTMLButtonElement;
+const codexPicker = document.getElementById('codex-picker')!;
+const codexPickerNote = document.getElementById('codex-picker-note')!;
+const codexThreadList = document.getElementById('codex-thread-list')!;
+codexAdd.innerHTML = codexMark;
+
+/// "5m ago" rather than a timestamp: the list is for picking the thread
+/// you were just in, and recency is what tells them apart.
+function ago(seconds: number | null): string {
+  if (!seconds) return '';
+  const minutes = Math.max(0, Math.round((Date.now() / 1000 - seconds) / 60));
+  if (minutes < 1) return 'just now';
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
+}
+
+function codexSessionFor(threadId: string): CodexSession | undefined {
+  return sessions.find((s): s is CodexSession => s.kind === 'codex' && s.threadId === threadId);
+}
+
+async function refreshCodexPicker() {
+  codexPickerNote.classList.remove('failed');
+  codexPickerNote.textContent = 'Reading your Codex threads…';
+  codexThreadList.replaceChildren();
+  try {
+    const threads = await invoke<CodexThread[]>('codex_list_threads');
+    codexPickerNote.textContent = threads.length
+      ? 'Pick a thread to carry into oTerm. The Codex desktop app keeps running it.'
+      : 'No Codex threads yet. Start one in the Codex desktop app first.';
+    for (const thread of threads) {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'codex-thread';
+      const title = document.createElement('span');
+      title.className = 'codex-thread-title';
+      title.textContent = thread.title;
+      const meta = document.createElement('span');
+      meta.className = 'codex-thread-meta';
+      const open = codexSessionFor(thread.id) ? 'open in oTerm' : '';
+      meta.textContent = [thread.workspace, ago(thread.updatedAt), open].filter(Boolean).join(' · ');
+      row.append(title, meta);
+      row.addEventListener('click', () => {
+        closeCodexPicker();
+        openCodexThread(thread);
+      });
+      codexThreadList.appendChild(row);
+    }
+  } catch (err) {
+    codexPickerNote.textContent = String(err);
+    codexPickerNote.classList.add('failed');
+  }
+}
+
+function openCodexPicker() {
+  if (mode !== 'panel') return;
+  codexPicker.hidden = false;
+  void refreshCodexPicker();
+}
+
+function closeCodexPicker() {
+  codexPicker.hidden = true;
+  focusActive();
+}
+
+codexAdd.addEventListener('click', openCodexPicker);
+codexPicker.querySelector('.codex-picker-close')!.addEventListener('click', closeCodexPicker);
+codexPicker.addEventListener('click', (event) => {
+  if (event.target === codexPicker) closeCodexPicker();
+});
+
+function interruptCodex(session: CodexSession) {
+  invoke('codex_interrupt', { threadId: session.threadId }).catch((err) =>
+    session.chat.showProblem(String(err)),
+  );
+}
+
+/// Subscribe a tab to its thread. Also what Reconnect does: the backend
+/// treats opening an open thread as starting that tab's connection over.
+async function connectCodex(session: CodexSession) {
+  const onEvent = new Channel<CodexEvent>();
+  onEvent.onmessage = (msg) => {
+    if (msg.event === 'view') {
+      session.chat.update(msg.data);
+      session.cwd = shortPath(msg.data.cwd);
+      session.tab.title = `Codex: ${msg.data.title}`;
+      if (active === session) render();
+    } else if (msg.event === 'agentStateChanged') {
+      setAgentState(session, msg.data.state, msg.data.cause);
+    } else {
+      session.chat.showProblem(msg.data.message);
+    }
+  };
+  session.chat.showProblem(null);
+  try {
+    session.id = await invoke<string>('codex_open_thread', { threadId: session.threadId, onEvent });
+  } catch (err) {
+    session.chat.showProblem(String(err));
+  }
+}
+
+/// Open a thread in a tab of its own, or go to the tab it is already in.
+function openCodexThread(thread: CodexThread) {
+  const existing = codexSessionFor(thread.id);
+  if (existing) {
+    activate(existing);
+    return;
+  }
+  const tab = document.createElement('button');
+  tab.className = 'tab has-icon codex';
+  tab.innerHTML = '<span class="dot"></span><span class="label"></span>';
+  (tab.querySelector('.label') as HTMLElement).innerHTML = codexMark;
+  tab.title = `Codex: ${thread.title}`;
+  tabsEl.insertBefore(tab, tabAdd);
+
+  // Declared before the chat so its callbacks can reach the session.
+  let session!: CodexSession;
+  const chat = new CodexChat(codexMark, {
+    send: async (text) => {
+      await invoke('codex_send', { threadId: thread.id, text });
+    },
+    interrupt: () => interruptCodex(session),
+    answer: async (approve) => {
+      await invoke('codex_answer', { threadId: thread.id, approve });
+    },
+    reconnect: () => void connectCodex(session),
+    draftChanged: (text) => {
+      session.pending = text;
+      if (active === session) showDraft();
+    },
+  });
+  terminalsEl.appendChild(chat.pane);
+  session = {
+    kind: 'codex',
+    id: '',
+    threadId: thread.id,
+    chat,
+    pane: chat.pane,
+    tab,
+    state: 'idle',
+    stateSince: Date.now(),
+    lastCause: '',
+    lastTurnMs: null,
+    pending: '',
+    cwd: null,
+  };
+  sessions.push(session);
+  tab.addEventListener('click', () => activate(session));
+  chat.pane.addEventListener('keydown', (event) => codexPaneKey(session, event));
+  activate(session);
+  void connectCodex(session);
+}
+
+/// The window shortcuts a terminal tab gets from xterm's key handler.
+function codexPaneKey(session: CodexSession, event: KeyboardEvent) {
+  if (!event.metaKey) return;
+  if (event.key === 't') addSession();
+  else if (event.key === 'w') closeSession(session);
+  else if (event.key === ',') openSettings();
+  else return;
+  event.preventDefault();
 }
 
 tabAdd.addEventListener('click', () => {
@@ -1433,7 +1679,7 @@ new ResizeObserver(() => {
   requestAnimationFrame(() => {
     refitQueued = false;
     const pane = active?.pane;
-    if (pane && pane.clientHeight > 0 && pane.clientWidth > 0) active?.fit.fit();
+    if (pane && pane.clientHeight > 0 && pane.clientWidth > 0) fitActive();
   });
 }).observe(terminalsEl);
 
