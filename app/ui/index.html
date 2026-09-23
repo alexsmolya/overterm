@@ -50,10 +50,11 @@
     </header>
 
     <div id="workspace">
-      <!-- One tab per session, plus the control that starts another. -->
+      <!-- One tab per session, plus the controls that start another: a
+           terminal, or a thread carried over from the Codex desktop app. -->
       <nav id="tabs">
-        <button id="codex-open" title="Browse Codex threads (read only)">C</button>
         <button id="tab-add" title="New session">+</button>
+        <button id="codex-add" title="Open a Codex thread"></button>
       </nav>
       <!-- One pane per session; only the active one is on screen. -->
       <div id="terminals"></div>
@@ -256,19 +257,20 @@
       </div>
     </div>
 
-    <div id="codex-sheet" hidden>
-      <div class="sheet codex-sheet-body">
+    <!-- Threads from the Codex desktop app, as a sheet like settings. -->
+    <div id="codex-picker" class="sheet-scrim" hidden>
+      <div class="sheet">
         <header class="sheet-head">
-          <span>Codex <small>Read only</small></span>
-          <button class="icon" id="codex-close" title="Close">×</button>
+          <span>Codex threads</span>
+          <button class="icon codex-picker-close" title="Close (Esc)">
+            <svg viewBox="0 0 12 12" aria-hidden="true">
+              <path d="m3 3 6 6M9 3l-6 6" />
+            </svg>
+          </button>
         </header>
         <div class="sheet-body">
-          <p class="note" id="codex-note">Codex is off until you open this view.</p>
-          <div id="codex-threads" class="codex-threads"></div>
-          <div class="row codex-actions">
-            <button id="codex-refresh" type="button">Refresh</button>
-            <button id="codex-detach" type="button" hidden>Detach</button>
-          </div>
+          <p class="note" id="codex-picker-note"></p>
+          <div id="codex-thread-list"></div>
         </div>
       </div>
     </div>
