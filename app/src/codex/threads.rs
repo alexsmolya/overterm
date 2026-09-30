@@ -17,6 +17,11 @@ use serde_json::{Value, json};
 
 const LIST_TIMEOUT: Duration = Duration::from_secs(10);
 const THREAD_LIMIT: u64 = 30;
+/// Codex's own `searchTerm` is case-sensitive, so a search reads pages of
+/// threads and filters them here instead. The page count bounds how far
+/// back it looks: 10 pages of 100 is the last thousand threads.
+const SEARCH_PAGE_SIZE: u64 = 100;
+const MAX_SEARCH_PAGES: usize = 10;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -125,22 +130,56 @@ fn converse(child: &mut Child, search_term: Option<&str>) -> Result<Vec<ThreadSu
     )?;
     reply_to(1)?;
     send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}))?;
-    let mut params = json!({
-        "limit": THREAD_LIMIT,
-        "archived": false,
-        "sortKey": "updated_at",
-        "useStateDbOnly": true,
-    });
-    if let Some(search_term) = search_term.filter(|term| !term.is_empty()) {
-        params["searchTerm"] = json!(search_term);
+    let term = search_term
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .map(str::to_lowercase);
+    let (page_size, max_pages) = match term {
+        Some(_) => (SEARCH_PAGE_SIZE, MAX_SEARCH_PAGES),
+        None => (THREAD_LIMIT, 1),
+    };
+    let mut found = Vec::new();
+    let mut cursor: Option<String> = None;
+    for page in 0..max_pages {
+        let mut params = json!({
+            "limit": page_size,
+            "archived": false,
+            "sortKey": "updated_at",
+            "useStateDbOnly": true,
+        });
+        if let Some(cursor) = &cursor {
+            params["cursor"] = json!(cursor);
+        }
+        let id = 2 + page as u64;
+        send(json!({"jsonrpc": "2.0", "id": id, "method": "thread/list", "params": params}))?;
+        let listed = reply_to(id)?;
+        let threads = listed
+            .get("data")
+            .and_then(Value::as_array)
+            .map(|threads| threads.iter().filter_map(summary).collect::<Vec<_>>())
+            .unwrap_or_default();
+        found.extend(threads.into_iter().filter(|thread| {
+            term.as_deref()
+                .is_none_or(|term| title_matches(&thread.title, term))
+        }));
+        if found.len() >= THREAD_LIMIT as usize {
+            found.truncate(THREAD_LIMIT as usize);
+            break;
+        }
+        cursor = listed
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
     }
-    send(json!({"jsonrpc": "2.0", "id": 2, "method": "thread/list", "params": params}))?;
-    let listed = reply_to(2)?;
-    Ok(listed
-        .get("data")
-        .and_then(Value::as_array)
-        .map(|threads| threads.iter().filter_map(summary).collect())
-        .unwrap_or_default())
+    Ok(found)
+}
+
+/// `term` is already lowercase.
+fn title_matches(title: &str, term: &str) -> bool {
+    title.to_lowercase().contains(term)
 }
 
 fn summary(thread: &Value) -> Option<ThreadSummary> {
@@ -281,27 +320,130 @@ mod tests {
         assert!(error.contains("state db locked"), "{error}");
     }
 
+    /// A stand-in app-server for searches. `pages` is a list of
+    /// `(data, nextCursor)` replies served in order; every request is
+    /// answered with the id it carried, and any request that carries a
+    /// `searchTerm`, or asks for a page other than the one the previous
+    /// reply pointed at, is answered with an error.
+    #[cfg(unix)]
+    fn paging_server(name: &str, pages: &[(&str, Option<&str>)]) -> PathBuf {
+        let dir = scratch(name);
+        let script = dir.join("codex");
+        let mut body = String::from(
+            "#!/bin/sh\n\
+             reply() { id=$(printf '%s' \"$1\" | sed -E 's/.*\"id\":([0-9]+).*/\\1/'); }\n\
+             read _; printf '%s\\n' '{\"id\":1,\"result\":{}}'\n\
+             read _\n",
+        );
+        let mut expect_cursor: Option<&str> = None;
+        for (data, next) in pages {
+            let check = match expect_cursor {
+                None => "*cursor*) bad=1 ;;".to_string(),
+                Some(cursor) => format!("*'\"cursor\":\"{cursor}\"'*) ;; *) bad=1 ;;"),
+            };
+            let next_json = next.map_or("null".to_string(), |c| format!("\"{c}\""));
+            body.push_str(&format!(
+                "read req; reply \"$req\"; bad=\n\
+                 case \"$req\" in *searchTerm*) bad=1 ;; esac\n\
+                 case \"$req\" in {check} esac\n\
+                 if [ -n \"$bad\" ]; then printf '{{\"id\":%s,\"error\":{{\"message\":\"unexpected request\"}}}}\\n' \"$id\"; exit 0; fi\n\
+                 printf '{{\"id\":%s,\"result\":{{\"data\":{data},\"nextCursor\":{next_json}}}}}\\n' \"$id\"\n"
+            ));
+            expect_cursor = *next;
+        }
+        body.push_str("read _ && touch \"$0.extra-request\"\n");
+        std::fs::write(&script, body).unwrap();
+        executable_mode(&script);
+        script
+    }
+
     #[cfg(unix)]
     #[test]
-    fn passes_a_search_term_to_the_thread_list_request() {
-        let dir = scratch("search-server");
+    fn search_ignores_case_and_follows_the_cursor_to_later_pages() {
+        let script = paging_server(
+            "search-pages",
+            &[
+                (r#"[{"id":"a","name":"Other work"}]"#, Some("c1")),
+                (
+                    r#"[{"id":"b","name":"Start new thread"},{"id":"c","name":"Restart the build"}]"#,
+                    None,
+                ),
+            ],
+        );
+        let found = list_threads(&script, Some("  START ")).unwrap();
+        let titles: Vec<&str> = found.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["Start new thread", "Restart the build"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_matches_the_title_the_picker_shows() {
+        // The second thread has no name, so the picker shows the first line
+        // of its preview. (The `\\n` is doubled because the fake server
+        // passes the reply through `printf`.) The first thread's preview contains the term but
+        // its shown title does not, so it is not a match.
+        let script = paging_server(
+            "search-shown-title",
+            &[(
+                r#"[{"id":"a","name":"Test PR","preview":"tell me something"},{"id":"b","name":null,"preview":"something else\\nmore"}]"#,
+                None,
+            )],
+        );
+        let found = list_threads(&script, Some("something")).unwrap();
+        let ids: Vec<&str> = found.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, ["b"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_gives_up_after_a_bounded_number_of_pages() {
+        // A server that always has another page. Each page answers to the
+        // cursor the last one named, so only the client's own cap ends this.
+        let dir = scratch("search-endless");
         let script = dir.join("codex");
         std::fs::write(
             &script,
             concat!(
                 "#!/bin/sh\n",
                 "read _; printf '%s\\n' '{\"id\":1,\"result\":{}}'\n",
-                "read _; read request\n",
-                "case \"$request\" in\n",
-                "  *searchTerm*older*) printf '%s\\n' '{\"id\":2,\"result\":{\"data\":[]}}' ;;\n",
-                "  *) printf '%s\\n' '{\"id\":2,\"error\":{\"message\":\"search term missing\"}}' ;;\n",
-                "esac\n",
-                "read _\n"
+                "read _\n",
+                "while read req; do\n",
+                "  id=$(printf '%s' \"$req\" | sed -E 's/.*\"id\":([0-9]+).*/\\1/')\n",
+                "  printf '{\"id\":%s,\"result\":{\"data\":[{\"id\":\"x\",\"name\":\"nope\"}],\"nextCursor\":\"more\"}}\\n' \"$id\"\n",
+                "  echo x >> \"$0.requests\"\n",
+                "done\n"
             ),
         )
         .unwrap();
         executable_mode(&script);
-        assert!(list_threads(&script, Some("older")).unwrap().is_empty());
+        assert!(list_threads(&script, Some("zzz")).unwrap().is_empty());
+        let requests = std::fs::read_to_string(script.with_file_name("codex.requests")).unwrap();
+        assert_eq!(requests.lines().count(), MAX_SEARCH_PAGES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listing_without_a_term_reads_one_page_and_sends_no_filter() {
+        for term in [None, Some(""), Some("   ")] {
+            let script = paging_server(
+                "no-term",
+                &[(r#"[{"id":"a","name":"Recent"}]"#, Some("ignored"))],
+            );
+            let found = list_threads(&script, term).unwrap();
+            assert_eq!(found.len(), 1, "{term:?}");
+            assert!(
+                !script.with_file_name("codex.extra-request").exists(),
+                "a second page was requested for {term:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn titles_match_by_lowercase_substring() {
+        assert!(title_matches("Start new thread", "start"));
+        assert!(title_matches("Start new thread", "new thr"));
+        assert!(title_matches("Überprüfung", "überpr"));
+        assert!(!title_matches("Start new thread", "starter"));
     }
 
     #[cfg(unix)]
