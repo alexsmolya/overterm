@@ -733,25 +733,21 @@ body.state-busy .pill .dot {
 }
 
 .codex-picker-search {
-  display: flex;
-  flex-direction: column;
-  gap: 5px;
-  color: var(--ink-2);
-  font-size: 11px;
-}
-
-.codex-picker-search input {
+  display: block;
   width: 100%;
   box-sizing: border-box;
+  /* The sheet body only pads 4px at the top, which suits the settings
+     headings and leaves this field tight against the header line. */
+  margin-top: 8px;
   padding: 7px 9px;
   border: 1px solid var(--line);
   border-radius: var(--radius-control);
   background: var(--body);
   color: var(--ink);
-  font: inherit;
+  font: 400 12px/1.3 var(--mono);
 }
 
-.codex-picker-search input:focus {
+.codex-picker-search:focus {
   outline: none;
   border-color: var(--ink-4);
 }
