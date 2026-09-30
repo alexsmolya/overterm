@@ -1559,6 +1559,7 @@ function openCodexPicker() {
   if (mode !== 'panel') return;
   codexPicker.hidden = false;
   codexThreadSearch.value = '';
+  codexThreadSearch.focus();
   void refreshCodexPicker();
 }
 
