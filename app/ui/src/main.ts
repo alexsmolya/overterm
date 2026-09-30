@@ -319,6 +319,7 @@ function applyMode(next: WindowMode) {
     // open means it comes back with a stale query on the next expand.
     if (!findBox.hidden) closeFind();
     if (!settingsSheet.hidden) closeSettings();
+    if (!codexPicker.hidden) closeCodexPicker();
     showDraft();
   }
   // Keep typing flowing across an automatic switch, but only when the
