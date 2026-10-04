@@ -156,6 +156,13 @@ fn answer_request(
         ApprovalKind::FileChange => Method::FileApproval,
         ApprovalKind::Other => return Err("Answer this one in the Codex desktop app.".into()),
     };
+    if !approval
+        .choices
+        .iter()
+        .any(|choice| choice.decision == decision)
+    {
+        return Err("Codex did not offer that answer.".into());
+    }
     Ok((
         method,
         json!({
@@ -558,32 +565,37 @@ mod tests {
         }
     }
 
-    fn approval(kind: ApprovalKind) -> Option<Approval> {
+    fn approval(kind: ApprovalKind, offered: &[Value]) -> Option<Approval> {
         Some(Approval {
             request_id: json!(2),
             kind,
             reason: None,
             command: Some("touch x".into()),
             cwd: None,
-            choices: Vec::new(),
-        })
-    }
-
-    fn approval_with_decisions(
-        kind: ApprovalKind,
-        available_decisions: Vec<Value>,
-    ) -> Option<Approval> {
-        Some(Approval {
-            choices: available_decisions
-                .into_iter()
+            // Labels are the core crate's business; only the decision is
+            // checked here.
+            choices: offered
+                .iter()
                 .map(|decision| Choice {
                     label: String::new(),
                     allow: false,
-                    decision,
+                    decision: decision.clone(),
                 })
                 .collect(),
-            ..approval(kind).unwrap()
         })
+    }
+
+    fn amendment(argv: &[&str]) -> Value {
+        json!({"acceptWithExecpolicyAmendment": {"execpolicy_amendment": argv}})
+    }
+
+    /// What the recorded command approval offers.
+    fn recorded_offer() -> Vec<Value> {
+        vec![
+            json!("accept"),
+            amendment(&["/bin/zsh", "-lc", "touch x"]),
+            json!("cancel"),
+        ]
     }
 
     fn recorded_changes() -> Vec<Value> {
@@ -647,16 +659,7 @@ mod tests {
         let command = view(
             Activity::Waiting,
             Some("turn-1"),
-            approval_with_decisions(
-                ApprovalKind::Command,
-                vec![
-                    json!("accept"),
-                    json!({"acceptWithExecpolicyAmendment": {
-                        "execpolicy_amendment": ["/bin/zsh", "-lc", "touch x"]
-                    }}),
-                    json!("cancel"),
-                ],
-            ),
+            approval(ApprovalKind::Command, &recorded_offer()),
         );
         assert_eq!(
             answer_request(Some(&command), "t1", json!("accept")),
@@ -665,36 +668,33 @@ mod tests {
                 json!({"conversationId": "t1", "requestId": 2, "decision": "accept"})
             ))
         );
-        assert_eq!(
-            answer_request(Some(&command), "t1", json!("cancel"))
-                .unwrap()
-                .1["decision"],
-            "cancel"
-        );
-        let amendment = json!({"acceptWithExecpolicyAmendment": {
-            "execpolicy_amendment": ["/bin/zsh", "-lc", "touch x"]
-        }});
-        assert_eq!(
-            answer_request(Some(&command), "t1", amendment.clone())
-                .unwrap()
-                .1["decision"],
-            amendment
-        );
+        for decision in recorded_offer() {
+            assert_eq!(
+                answer_request(Some(&command), "t1", decision.clone())
+                    .unwrap()
+                    .1["decision"],
+                decision
+            );
+        }
         let file = view(
             Activity::Waiting,
             Some("turn-1"),
-            approval(ApprovalKind::FileChange),
+            approval(
+                ApprovalKind::FileChange,
+                &[json!("accept"), json!("decline")],
+            ),
         );
         assert_eq!(
-            answer_request(Some(&file), "t1", json!("accept"))
-                .unwrap()
-                .0,
-            Method::FileApproval
+            answer_request(Some(&file), "t1", json!("decline")),
+            Ok((
+                Method::FileApproval,
+                json!({"conversationId": "t1", "requestId": 2, "decision": "decline"})
+            ))
         );
         let other = view(
             Activity::Waiting,
             Some("turn-1"),
-            approval(ApprovalKind::Other),
+            approval(ApprovalKind::Other, &[]),
         );
         assert!(answer_request(Some(&other), "t1", json!("accept")).is_err());
         assert!(
@@ -705,6 +705,36 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn only_a_decision_codex_offered_is_sent() {
+        let command = view(
+            Activity::Waiting,
+            Some("turn-1"),
+            approval(ApprovalKind::Command, &recorded_offer()),
+        );
+        for unoffered in [
+            json!({"somethingNew": {}}),
+            Value::Null,
+            json!("acceptForSession"),
+            json!("decline"),
+            // An amendment writes a lasting rule, so a prefix other than
+            // the offered one must not slip through.
+            amendment(&["/bin/zsh", "-lc", "rm -rf x"]),
+            amendment(&["/bin/zsh"]),
+        ] {
+            assert!(
+                answer_request(Some(&command), "t1", unoffered.clone()).is_err(),
+                "{unoffered} was not offered"
+            );
+        }
+        let nothing_known = view(
+            Activity::Waiting,
+            Some("turn-1"),
+            approval(ApprovalKind::Command, &[]),
+        );
+        assert!(answer_request(Some(&nothing_known), "t1", json!("accept")).is_err());
     }
 
     #[test]
