@@ -1,4 +1,36 @@
+import MarkdownIt, { type StateInline, type Token } from 'markdown-it';
 import { openUrl } from '@tauri-apps/plugin-opener';
+
+const STAR = 0x2a;
+const UNDERSCORE = 0x5f;
+
+/// Codex replies are mostly about code, where `__init__` and `snake_case`
+/// are names and stars touching a slash are globs (`src/**/*.ts`).
+/// CommonMark would pair those up as emphasis, so they are kept as text
+/// before the emphasis rule sees them.
+function literalDelimiters(state: StateInline, silent: boolean): boolean {
+  const marker = state.src.charCodeAt(state.pos);
+  if (marker !== STAR && marker !== UNDERSCORE) return false;
+  let end = state.pos;
+  while (end < state.posMax && state.src.charCodeAt(end) === marker) end += 1;
+  if (marker === STAR && state.src[state.pos - 1] !== '/' && state.src[end] !== '/') return false;
+  if (!silent) state.pending += state.src.slice(state.pos, end);
+  state.pos = end;
+  return true;
+}
+
+const md = new MarkdownIt({ html: false, linkify: false, typographer: false });
+md.inline.ruler.before('emphasis', 'literal_delimiters', literalDelimiters);
+
+const BLOCK_TAGS = new Set(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'ul', 'ol', 'li', 'blockquote', 'thead', 'tbody', 'tr', 'th', 'td']);
+
+const BLOCK_CLASSES: Record<string, string> = {
+  paragraph_open: 'codex-text',
+  heading_open: 'codex-heading',
+  bullet_list_open: 'codex-list unordered',
+  ordered_list_open: 'codex-list ordered',
+  blockquote_open: 'codex-quote',
+};
 
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, className?: string, text?: string) {
   const node = document.createElement(tag);
@@ -7,167 +39,137 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, className?: string, t
   return node;
 }
 
-function safeMarkdownUrl(destination: string): string | null {
-  if (!/^https?:\/\//i.test(destination)) return null;
+function httpUrl(destination: string): URL | null {
   try {
-    return new URL(destination).href;
+    const url = new URL(destination);
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url : null;
   } catch {
     return null;
   }
 }
 
-function appendInlineMarkdown(target: HTMLElement, text: string) {
-  let rest = text;
-  while (rest) {
-    if (rest.startsWith('\\') && rest.length > 1) {
-      target.appendChild(document.createTextNode(rest[1]));
-      rest = rest.slice(2);
-      continue;
-    }
+function plainText(tokens: Token[]): string {
+  return tokens
+    .map((token) => {
+      if (token.children) return plainText(token.children);
+      return token.type === 'softbreak' ? '\n' : token.content;
+    })
+    .join('');
+}
 
-    const code = rest.match(/^(`+)([\s\S]*?)\1/);
-    if (code) {
-      target.appendChild(el('code', 'codex-inline-code', code[2].replace(/\n/g, ' ')));
-      rest = rest.slice(code[0].length);
-      continue;
-    }
+function openBlock(parent: HTMLElement, token: Token): HTMLElement {
+  if (token.hidden) return parent;
+  if (token.type === 'table_open') {
+    const scroller = el('div', 'codex-table');
+    const table = el('table');
+    scroller.appendChild(table);
+    parent.appendChild(scroller);
+    return table;
+  }
+  const node = document.createElement(BLOCK_TAGS.has(token.tag) ? token.tag : 'div');
+  const className = BLOCK_CLASSES[token.type];
+  if (className) node.className = className;
+  const start = token.attrGet('start');
+  if (start !== null) node.setAttribute('start', String(start));
+  const align = String(token.attrGet('style') ?? '').match(/text-align:(left|right|center)/)?.[1];
+  if (align) node.style.textAlign = align;
+  parent.appendChild(node);
+  return node;
+}
 
-    const link = rest.match(/^\[([^\]]+)\]\((https?:\/\/[^)\s]+)(?:\s+["'][^)]*["'])?\)/i);
-    if (link) {
-      const url = safeMarkdownUrl(link[2]);
-      if (url) {
-        const anchor = el('a', 'codex-link');
-        appendInlineMarkdown(anchor, link[1]);
-        anchor.href = url;
-        anchor.addEventListener('click', (event) => {
-          event.preventDefault();
-          void openUrl(url).catch((error) => console.error(`could not open ${url}:`, error));
-        });
-        target.appendChild(anchor);
-      } else {
-        target.appendChild(document.createTextNode(link[0]));
-      }
-      rest = rest.slice(link[0].length);
-      continue;
-    }
-
-    const strong = rest.match(/^(\*\*|__)(?=\S)([\s\S]*?\S)\1/);
-    if (strong) {
-      const node = el('strong');
-      appendInlineMarkdown(node, strong[2]);
-      target.appendChild(node);
-      rest = rest.slice(strong[0].length);
-      continue;
-    }
-
-    const emphasis = rest.match(/^(\*|_)(?=\S)([\s\S]*?\S)\1/);
-    if (emphasis) {
-      const node = el('em');
-      appendInlineMarkdown(node, emphasis[2]);
-      target.appendChild(node);
-      rest = rest.slice(emphasis[0].length);
-      continue;
-    }
-
-    const nextSpecial = rest.search(/[\\`[*_]/);
-    if (nextSpecial < 0) {
-      target.appendChild(document.createTextNode(rest));
+function appendLeafBlock(parent: HTMLElement, token: Token) {
+  switch (token.type) {
+    case 'inline':
+      appendInline(parent, token.children ?? []);
       break;
-    }
-    if (nextSpecial > 0) {
-      target.appendChild(document.createTextNode(rest.slice(0, nextSpecial)));
-      rest = rest.slice(nextSpecial);
-      continue;
-    }
-
-    target.appendChild(document.createTextNode(rest[0]));
-    rest = rest.slice(1);
+    case 'fence':
+    case 'code_block':
+      parent.appendChild(el('pre', 'codex-code', token.content.replace(/\n$/, '')));
+      break;
+    case 'hr':
+      parent.appendChild(el('hr', 'codex-rule'));
+      break;
+    default:
+      if (token.content) parent.appendChild(el('p', 'codex-text', token.content.trimEnd()));
   }
 }
 
-function appendMarkdownParagraph(target: HTMLElement, lines: string[]) {
-  const paragraph = el('div', 'codex-text');
-  lines.forEach((line, index) => {
-    if (index) paragraph.appendChild(document.createElement('br'));
-    appendInlineMarkdown(paragraph, line);
+function openLink(parent: HTMLElement, token: Token): HTMLElement {
+  const destination = String(token.attrGet('href') ?? '');
+  const url = httpUrl(destination);
+  if (!url) {
+    const reference = el('span', 'codex-link-ref');
+    reference.title = md.normalizeLinkText(destination);
+    parent.appendChild(reference);
+    return reference;
+  }
+  const anchor = el('a', 'codex-link');
+  anchor.href = url.href;
+  anchor.title = url.href;
+  anchor.addEventListener('click', (event) => {
+    event.preventDefault();
+    openUrl(url.href).catch((err) => console.error(`could not open ${url.href}:`, err));
   });
-  target.appendChild(paragraph);
+  parent.appendChild(anchor);
+  return anchor;
 }
 
-function appendMarkdownList(target: HTMLElement, lines: string[], ordered: boolean) {
-  const list = el(ordered ? 'ol' : 'ul', `codex-list ${ordered ? 'ordered' : 'unordered'}`);
-  for (const line of lines) {
-    const match = ordered ? line.match(/^ {0,3}\d+[.)]\s+(.*)$/) : line.match(/^ {0,3}[-+*]\s+(.*)$/);
-    if (!match) break;
-    const item = el('li');
-    appendInlineMarkdown(item, match[1]);
-    list.appendChild(item);
+/// Link text that is itself a URL can point somewhere else than it says,
+/// so the real host is shown next to it when the two disagree.
+function closeLink(link: HTMLElement) {
+  if (!(link instanceof HTMLAnchorElement)) return;
+  const shown = httpUrl(link.textContent?.trim() ?? '');
+  const real = new URL(link.getAttribute('href') ?? '');
+  if (shown && shown.host !== real.host) link.after(' ', el('span', 'codex-link-host', `(${real.host})`));
+}
+
+function appendInline(target: HTMLElement, tokens: Token[]) {
+  const parents = [target];
+  for (const token of tokens) {
+    const parent = parents[parents.length - 1];
+    switch (token.type) {
+      case 'softbreak':
+        parent.appendChild(document.createTextNode('\n'));
+        break;
+      case 'hardbreak':
+        parent.appendChild(el('br'));
+        break;
+      case 'code_inline':
+        parent.appendChild(el('code', 'codex-inline-code', token.content));
+        break;
+      case 'image':
+        parent.appendChild(document.createTextNode(plainText(token.children ?? [])));
+        break;
+      case 'strong_open':
+      case 'em_open':
+      case 's_open':
+        parents.push(parent.appendChild(document.createElement(token.tag)));
+        break;
+      case 'link_open':
+        parents.push(openLink(parent, token));
+        break;
+      case 'link_close':
+        closeLink(parents.pop()!);
+        break;
+      default:
+        if (token.nesting === 1) parents.push(parent.appendChild(el('span')));
+        else if (token.nesting === -1) parents.pop();
+        else parent.appendChild(document.createTextNode(token.content));
+    }
   }
-  target.appendChild(list);
 }
 
-/// Agent replies are Markdown. This is deliberately a small renderer rather
-/// than an HTML parser: every node is created by hand and all Codex text enters
-/// through text nodes, so even HTML-looking model output remains inert text.
+/// Fills `target` with a Codex reply rendered from Markdown. Every element is
+/// created by hand from markdown-it's tokens and every piece of Codex text goes
+/// in as a text node, so HTML in a reply stays inert text and only http(s)
+/// links become anchors.
 export function renderMarkdown(target: HTMLElement, text: string) {
   target.replaceChildren();
-  const lines = text.replace(/\r\n?/g, '\n').split('\n');
-  let paragraph: string[] = [];
-  const flushParagraph = () => {
-    if (paragraph.length) appendMarkdownParagraph(target, paragraph);
-    paragraph = [];
-  };
-
-  for (let index = 0; index < lines.length; ) {
-    const line = lines[index];
-    const fence = line.match(/^ {0,3}```[^\n]*$/);
-    if (fence) {
-      flushParagraph();
-      const code: string[] = [];
-      index += 1;
-      while (index < lines.length && !/^ {0,3}```\s*$/.test(lines[index])) {
-        code.push(lines[index]);
-        index += 1;
-      }
-      if (index < lines.length) index += 1;
-      target.appendChild(el('pre', 'codex-code', code.join('\n')));
-      continue;
-    }
-
-    const heading = line.match(/^ {0,3}(#{1,6})\s+(.*?)\s*#*\s*$/);
-    if (heading) {
-      flushParagraph();
-      const title = el(`h${heading[1].length}` as keyof HTMLElementTagNameMap, 'codex-heading');
-      appendInlineMarkdown(title, heading[2]);
-      target.appendChild(title);
-      index += 1;
-      continue;
-    }
-
-    if (/^ {0,3}[-+*]\s+/.test(line)) {
-      flushParagraph();
-      const items: string[] = [];
-      while (index < lines.length && /^ {0,3}[-+*]\s+/.test(lines[index])) items.push(lines[index++]);
-      appendMarkdownList(target, items, false);
-      continue;
-    }
-
-    if (/^ {0,3}\d+[.)]\s+/.test(line)) {
-      flushParagraph();
-      const items: string[] = [];
-      while (index < lines.length && /^ {0,3}\d+[.)]\s+/.test(lines[index])) items.push(lines[index++]);
-      appendMarkdownList(target, items, true);
-      continue;
-    }
-
-    if (!line.trim()) {
-      flushParagraph();
-      index += 1;
-      continue;
-    }
-
-    paragraph.push(line);
-    index += 1;
+  const parents = [target];
+  for (const token of md.parse(text, {})) {
+    const parent = parents[parents.length - 1];
+    if (token.nesting === 1) parents.push(openBlock(parent, token));
+    else if (token.nesting === -1) parents.pop();
+    else appendLeafBlock(parent, token);
   }
-  flushParagraph();
 }
