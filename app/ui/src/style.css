@@ -1470,7 +1470,14 @@ body.mode-bar #grips {
 
 .codex-approval-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
+}
+
+.codex-approval-actions button {
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  text-align: left;
 }
 
 .codex-approval-actions .approve {

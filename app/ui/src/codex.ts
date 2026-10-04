@@ -23,13 +23,8 @@ type Item =
   | { kind: 'fileChange'; id: string; status: string; paths: string[] }
   | { kind: 'note'; id: string; text: string };
 
-type ApprovalDecision =
-  | string
-  | number
-  | boolean
-  | null
-  | ApprovalDecision[]
-  | { [key: string]: ApprovalDecision };
+/// Labelled by the backend. `decision` goes back exactly as it came.
+type Choice = { label: string; allow: boolean; decision: unknown };
 
 type Approval = {
   requestId: number | string;
@@ -37,13 +32,13 @@ type Approval = {
   reason: string | null;
   command: string | null;
   cwd: string | null;
-  availableDecisions?: ApprovalDecision[] | null;
+  choices: Choice[];
 };
 
 export type ChatActions = {
   send(text: string): Promise<void>;
   interrupt(): void;
-  answer(decision: ApprovalDecision): Promise<void>;
+  answer(decision: unknown): Promise<void>;
   reconnect(): void;
   draftChanged(text: string): void;
 };
@@ -87,35 +82,6 @@ function statusLabel(status: string): string {
     default:
       return status;
   }
-}
-
-function isDecisionObject(decision: ApprovalDecision): decision is { [key: string]: ApprovalDecision } {
-  return typeof decision === 'object' && decision !== null && !Array.isArray(decision);
-}
-
-function humanizeDecisionKey(key: string): string {
-  const words = key.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/[_-]+/g, ' ').trim();
-  return words ? words[0].toUpperCase() + words.slice(1) : 'Choose this option';
-}
-
-function decisionLabel(decision: ApprovalDecision): string {
-  if (decision === 'accept') return 'Allow once';
-  if (decision === 'cancel' || decision === 'decline') return 'Decline';
-  if (isDecisionObject(decision)) {
-    if ('acceptWithExecpolicyAmendment' in decision) return 'Always allow this command';
-    const key = Object.keys(decision)[0];
-    return humanizeDecisionKey(key ?? 'unknown decision');
-  }
-  if (typeof decision === 'string') return humanizeDecisionKey(decision);
-  return `Choose ${typeof decision} option`;
-}
-
-function isAllowDecision(decision: ApprovalDecision): boolean {
-  return decision === 'accept' || (isDecisionObject(decision) && 'acceptWithExecpolicyAmendment' in decision);
-}
-
-function approvalDecisions(approval: Approval): ApprovalDecision[] {
-  return approval.availableDecisions?.length ? approval.availableDecisions : ['accept', 'decline'];
 }
 
 function renderItem(item: Item): HTMLElement {
@@ -396,25 +362,24 @@ export class CodexChat {
     this.approvalEl.appendChild(el('div', 'codex-approval-title', title));
     if (approval.reason) this.approvalEl.appendChild(el('p', 'codex-approval-reason', approval.reason));
     if (approval.command) this.approvalEl.appendChild(el('pre', 'codex-code', approval.command));
-    if (approval.kind === 'other') {
+    if (approval.kind === 'other' || approval.choices.length === 0) {
       this.approvalEl.appendChild(el('p', 'codex-approval-reason', 'Answer this one in the Codex desktop app.'));
       return;
     }
     const buttons = el('div', 'codex-approval-actions');
-    for (const decision of approvalDecisions(approval)) {
-      const button = el('button', isAllowDecision(decision) ? 'approve' : undefined, decisionLabel(decision));
+    const setDisabled = (disabled: boolean) => {
+      for (const button of buttons.querySelectorAll('button')) button.disabled = disabled;
+    };
+    for (const choice of approval.choices) {
+      const button = el('button', choice.allow ? 'approve' : undefined, choice.label);
       button.type = 'button';
       button.addEventListener('click', async () => {
-        buttons.querySelectorAll<HTMLButtonElement>('button').forEach((choice) => {
-          choice.disabled = true;
-        });
+        setDisabled(true);
         try {
-          await this.actions.answer(decision);
+          await this.actions.answer(choice.decision);
         } catch (err) {
           this.showProblem(String(err));
-          buttons.querySelectorAll<HTMLButtonElement>('button').forEach((choice) => {
-            choice.disabled = false;
-          });
+          setDisabled(false);
         }
       });
       buttons.appendChild(button);
