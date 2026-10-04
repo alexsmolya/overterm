@@ -25,18 +25,22 @@ type Item =
   | { kind: 'fileChange'; id: string; status: string; paths: string[] }
   | { kind: 'note'; id: string; text: string };
 
+/// Labelled by the backend. `decision` goes back exactly as it came.
+type Choice = { label: string; allow: boolean; decision: unknown };
+
 type Approval = {
   requestId: number | string;
   kind: 'command' | 'fileChange' | 'other';
   reason: string | null;
   command: string | null;
   cwd: string | null;
+  choices: Choice[];
 };
 
 export type ChatActions = {
   send(text: string): Promise<void>;
   interrupt(): void;
-  answer(approve: boolean): Promise<void>;
+  answer(decision: unknown): Promise<void>;
   reconnect(): void;
   draftChanged(text: string): void;
 };
@@ -341,29 +345,28 @@ export class CodexChat {
     this.approvalEl.appendChild(el('div', 'codex-approval-title', title));
     if (approval.reason) this.approvalEl.appendChild(el('p', 'codex-approval-reason', approval.reason));
     if (approval.command) this.approvalEl.appendChild(el('pre', 'codex-code', approval.command));
-    if (approval.kind === 'other') {
+    if (approval.kind === 'other' || approval.choices.length === 0) {
       this.approvalEl.appendChild(el('p', 'codex-approval-reason', 'Answer this one in the Codex desktop app.'));
       return;
     }
     const buttons = el('div', 'codex-approval-actions');
-    const approve = el('button', 'approve', 'Approve');
-    const decline = el('button', 'decline', 'Decline');
-    for (const [button, value] of [
-      [approve, true],
-      [decline, false],
-    ] as const) {
+    const setDisabled = (disabled: boolean) => {
+      for (const button of buttons.querySelectorAll('button')) button.disabled = disabled;
+    };
+    for (const choice of approval.choices) {
+      const button = el('button', choice.allow ? 'approve' : undefined, choice.label);
       button.type = 'button';
       button.addEventListener('click', async () => {
-        approve.disabled = decline.disabled = true;
+        setDisabled(true);
         try {
-          await this.actions.answer(value);
+          await this.actions.answer(choice.decision);
         } catch (err) {
           this.showProblem(String(err));
-          approve.disabled = decline.disabled = false;
+          setDisabled(false);
         }
       });
+      buttons.appendChild(button);
     }
-    buttons.append(approve, decline);
     this.approvalEl.appendChild(buttons);
   }
 }
