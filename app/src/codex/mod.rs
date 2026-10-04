@@ -146,7 +146,7 @@ fn interrupt_request(
 fn answer_request(
     view: Option<&ThreadView>,
     thread_id: &str,
-    approve: bool,
+    decision: Value,
 ) -> Result<(Method, Value), String> {
     let approval = view
         .and_then(|view| view.approval.as_ref())
@@ -156,12 +156,19 @@ fn answer_request(
         ApprovalKind::FileChange => Method::FileApproval,
         ApprovalKind::Other => return Err("Answer this one in the Codex desktop app.".into()),
     };
+    if !approval
+        .choices
+        .iter()
+        .any(|choice| choice.decision == decision)
+    {
+        return Err("Codex did not offer that answer.".into());
+    }
     Ok((
         method,
         json!({
             "conversationId": thread_id,
             "requestId": approval.request_id,
-            "decision": if approve { "accept" } else { "decline" },
+            "decision": decision,
         }),
     ))
 }
@@ -289,9 +296,9 @@ mod live {
             self.request(method, params)
         }
 
-        pub fn answer(&self, thread_id: &str, approve: bool) -> Result<(), String> {
+        pub fn answer(&self, thread_id: &str, decision: Value) -> Result<(), String> {
             let (method, params) =
-                answer_request(self.view(thread_id)?.as_ref(), thread_id, approve)?;
+                answer_request(self.view(thread_id)?.as_ref(), thread_id, decision)?;
             self.request(method, params)
         }
 
@@ -475,7 +482,7 @@ impl CodexSessions {
     pub fn interrupt(&self, _: &str) -> Result<(), String> {
         Err(Self::UNSUPPORTED.into())
     }
-    pub fn answer(&self, _: &str, _: bool) -> Result<(), String> {
+    pub fn answer(&self, _: &str, _: Value) -> Result<(), String> {
         Err(Self::UNSUPPORTED.into())
     }
     pub fn close(&self, _: &str, _: &Choreographer) {}
@@ -522,10 +529,10 @@ pub fn codex_interrupt(
 #[tauri::command(async)]
 pub fn codex_answer(
     thread_id: String,
-    approve: bool,
+    decision: Value,
     sessions: State<'_, CodexSessions>,
 ) -> Result<(), String> {
-    sessions.answer(&thread_id, approve)
+    sessions.answer(&thread_id, decision)
 }
 
 #[tauri::command(async)]
@@ -541,7 +548,7 @@ pub fn codex_close(
 mod tests {
     use super::*;
     use overterm_core::Signal;
-    use overterm_core::codex::view::{Activity, Approval};
+    use overterm_core::codex::view::{Activity, Approval, Choice};
 
     fn view(
         activity: Activity,
@@ -558,14 +565,37 @@ mod tests {
         }
     }
 
-    fn approval(kind: ApprovalKind) -> Option<Approval> {
+    fn approval(kind: ApprovalKind, offered: &[Value]) -> Option<Approval> {
         Some(Approval {
             request_id: json!(2),
             kind,
             reason: None,
             command: Some("touch x".into()),
             cwd: None,
+            // Labels are the core crate's business; only the decision is
+            // checked here.
+            choices: offered
+                .iter()
+                .map(|decision| Choice {
+                    label: String::new(),
+                    allow: false,
+                    decision: decision.clone(),
+                })
+                .collect(),
         })
+    }
+
+    fn amendment(argv: &[&str]) -> Value {
+        json!({"acceptWithExecpolicyAmendment": {"execpolicy_amendment": argv}})
+    }
+
+    /// What the recorded command approval offers.
+    fn recorded_offer() -> Vec<Value> {
+        vec![
+            json!("accept"),
+            amendment(&["/bin/zsh", "-lc", "touch x"]),
+            json!("cancel"),
+        ]
     }
 
     fn recorded_changes() -> Vec<Value> {
@@ -629,35 +659,82 @@ mod tests {
         let command = view(
             Activity::Waiting,
             Some("turn-1"),
-            approval(ApprovalKind::Command),
+            approval(ApprovalKind::Command, &recorded_offer()),
         );
         assert_eq!(
-            answer_request(Some(&command), "t1", true),
+            answer_request(Some(&command), "t1", json!("accept")),
             Ok((
                 Method::CommandApproval,
                 json!({"conversationId": "t1", "requestId": 2, "decision": "accept"})
             ))
         );
-        assert_eq!(
-            answer_request(Some(&command), "t1", false).unwrap().1["decision"],
-            "decline"
-        );
+        for decision in recorded_offer() {
+            assert_eq!(
+                answer_request(Some(&command), "t1", decision.clone())
+                    .unwrap()
+                    .1["decision"],
+                decision
+            );
+        }
         let file = view(
             Activity::Waiting,
             Some("turn-1"),
-            approval(ApprovalKind::FileChange),
+            approval(
+                ApprovalKind::FileChange,
+                &[json!("accept"), json!("decline")],
+            ),
         );
         assert_eq!(
-            answer_request(Some(&file), "t1", true).unwrap().0,
-            Method::FileApproval
+            answer_request(Some(&file), "t1", json!("decline")),
+            Ok((
+                Method::FileApproval,
+                json!({"conversationId": "t1", "requestId": 2, "decision": "decline"})
+            ))
         );
         let other = view(
             Activity::Waiting,
             Some("turn-1"),
-            approval(ApprovalKind::Other),
+            approval(ApprovalKind::Other, &[]),
         );
-        assert!(answer_request(Some(&other), "t1", true).is_err());
-        assert!(answer_request(Some(&view(Activity::Idle, None, None)), "t1", true).is_err());
+        assert!(answer_request(Some(&other), "t1", json!("accept")).is_err());
+        assert!(
+            answer_request(
+                Some(&view(Activity::Idle, None, None)),
+                "t1",
+                json!("accept")
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn only_a_decision_codex_offered_is_sent() {
+        let command = view(
+            Activity::Waiting,
+            Some("turn-1"),
+            approval(ApprovalKind::Command, &recorded_offer()),
+        );
+        for unoffered in [
+            json!({"somethingNew": {}}),
+            Value::Null,
+            json!("acceptForSession"),
+            json!("decline"),
+            // An amendment writes a lasting rule, so a prefix other than
+            // the offered one must not slip through.
+            amendment(&["/bin/zsh", "-lc", "rm -rf x"]),
+            amendment(&["/bin/zsh"]),
+        ] {
+            assert!(
+                answer_request(Some(&command), "t1", unoffered.clone()).is_err(),
+                "{unoffered} was not offered"
+            );
+        }
+        let nothing_known = view(
+            Activity::Waiting,
+            Some("turn-1"),
+            approval(ApprovalKind::Command, &[]),
+        );
+        assert!(answer_request(Some(&nothing_known), "t1", json!("accept")).is_err());
     }
 
     #[test]
