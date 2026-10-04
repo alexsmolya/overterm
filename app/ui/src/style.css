@@ -1451,8 +1451,10 @@ body.mode-bar #grips {
   overflow-wrap: anywhere;
 }
 
-/* Code keeps its lines and scrolls sideways; wrapping would misalign it. */
-.codex-code {
+/* Code in a reply keeps its lines and scrolls sideways; wrapping would
+   misalign it. An approval's command still wraps, so its tail can't hide
+   off-screen while someone decides whether to allow it. */
+.codex-item.agent .codex-code {
   overflow-x: auto;
   white-space: pre;
   overflow-wrap: normal;
