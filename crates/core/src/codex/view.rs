@@ -114,9 +114,20 @@ pub struct Approval {
     pub reason: Option<String>,
     pub command: Option<String>,
     pub cwd: Option<String>,
-    /// The exact decisions offered by Codex, including object decisions.
-    /// `None` means the request did not provide usable decision metadata.
-    pub available_decisions: Option<Vec<Value>>,
+    /// One button each, in the order Codex offers them. Empty when none of
+    /// the offered decisions is one oTerm knows how to label.
+    pub choices: Vec<Choice>,
+}
+
+/// One answer to an approval.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Choice {
+    pub label: String,
+    /// Drawn as the approving button.
+    pub allow: bool,
+    /// Sent back exactly as Codex offered it.
+    pub decision: Value,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -317,12 +328,69 @@ fn approval(request: &Value) -> Approval {
         reason: text(params, "reason"),
         command: text(params, "command"),
         cwd: text(params, "cwd"),
-        available_decisions: params
-            .get("availableDecisions")
-            .and_then(Value::as_array)
-            .filter(|decisions| !decisions.is_empty())
-            .cloned(),
+        choices: choices(kind, params),
     }
+}
+
+/// Only command approvals list `availableDecisions`. Without a usable list
+/// the answer is the accept or decline that every approval understands.
+fn choices(kind: ApprovalKind, params: &Value) -> Vec<Choice> {
+    if kind == ApprovalKind::Other {
+        return Vec::new();
+    }
+    match params.get("availableDecisions").and_then(Value::as_array) {
+        Some(offered) if !offered.is_empty() => offered.iter().filter_map(choice).collect(),
+        _ => ["accept", "decline"]
+            .into_iter()
+            .filter_map(|decision| choice(&Value::from(decision)))
+            .collect(),
+    }
+}
+
+/// `None` for anything without a known label, so a decision Codex adds
+/// later is left to the desktop app instead of shown as a guess.
+fn choice(decision: &Value) -> Option<Choice> {
+    let (label, allow) = match decision {
+        Value::String(name) => match name.as_str() {
+            "accept" => ("Allow once".to_owned(), true),
+            "acceptForSession" => ("Allow for this session".to_owned(), true),
+            "decline" => ("Decline".to_owned(), false),
+            // Decline lets the agent carry on with the turn, cancel also
+            // interrupts it.
+            "cancel" => ("Decline and stop".to_owned(), false),
+            _ => return None,
+        },
+        Value::Object(map) if map.len() == 1 => {
+            let (key, body) = map.iter().next()?;
+            match key.as_str() {
+                "acceptWithExecpolicyAmendment" => {
+                    body.get("execpolicy_amendment")
+                        .and_then(Value::as_array)
+                        .filter(|argv| !argv.is_empty() && argv.iter().all(Value::is_string))?;
+                    ("Allow similar commands".to_owned(), true)
+                }
+                "applyNetworkPolicyAmendment" => {
+                    let rule = body.get("network_policy_amendment")?;
+                    let host = rule
+                        .get("host")
+                        .and_then(Value::as_str)
+                        .filter(|host| !host.is_empty())?;
+                    match rule.get("action").and_then(Value::as_str)? {
+                        "allow" => (format!("Always allow {host}"), true),
+                        "deny" => (format!("Always block {host}"), false),
+                        _ => return None,
+                    }
+                }
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    Some(Choice {
+        label,
+        allow,
+        decision: decision.clone(),
+    })
 }
 
 /// Turns the views of one conversation into the state changes the window
@@ -478,20 +546,32 @@ mod tests {
             approval.command.as_deref(),
             Some("/bin/zsh -lc 'touch ~/Desktop/overterm-approval-probe.txt'")
         );
-        let decisions = json!([
-            "accept",
-            {"acceptWithExecpolicyAmendment": {
-                "execpolicy_amendment": ["/bin/zsh", "-lc", "touch ~/Desktop/overterm-approval-probe.txt"]
-            }},
-            "cancel"
-        ]);
+        let amendment = json!({"acceptWithExecpolicyAmendment": {
+            "execpolicy_amendment": ["/bin/zsh", "-lc", "touch ~/Desktop/overterm-approval-probe.txt"]
+        }});
         assert_eq!(
-            approval.available_decisions,
-            Some(decisions.as_array().unwrap().clone())
+            approval.choices,
+            [
+                Choice {
+                    label: "Allow once".into(),
+                    allow: true,
+                    decision: json!("accept")
+                },
+                Choice {
+                    label: "Allow similar commands".into(),
+                    allow: true,
+                    decision: amendment.clone()
+                },
+                Choice {
+                    label: "Decline and stop".into(),
+                    allow: false,
+                    decision: json!("cancel")
+                },
+            ]
         );
         assert_eq!(
-            serde_json::to_value(waiting).unwrap()["approval"]["availableDecisions"],
-            decisions
+            serde_json::to_value(waiting).unwrap()["approval"]["choices"][1],
+            json!({"label": "Allow similar commands", "allow": true, "decision": amendment})
         );
         assert!(
             approval
@@ -568,40 +648,124 @@ mod tests {
         let approval = view.approval.unwrap();
         assert_eq!(approval.kind, ApprovalKind::Other);
         assert_eq!(approval.request_id, json!("q1"));
-        assert_eq!(approval.available_decisions, None);
+        assert!(approval.choices.is_empty());
         assert_eq!(view.activity, Activity::Waiting);
     }
 
-    #[test]
-    fn missing_or_malformed_available_decisions_fall_back_to_legacy_choices() {
-        let missing = state_with(
-            json!([]),
-            json!({"type": "active", "activeFlags": ["waitingOnApproval"]}),
-            json!([{
-                "method": "item/commandExecution/requestApproval",
-                "id": 2,
-                "params": {"kind": "command"}
-            }]),
-        );
-        assert_eq!(
-            thread_view(&missing).approval.unwrap().available_decisions,
-            None
-        );
-
+    fn requested(method: &str, params: Value) -> Approval {
         let state = state_with(
             json!([]),
             json!({"type": "active", "activeFlags": ["waitingOnApproval"]}),
-            json!([{
-                "method": "item/commandExecution/requestApproval",
-                "id": 2,
-                "params": {
-                    "kind": "command",
-                    "availableDecisions": {"accept": true}
-                }
-            }]),
+            json!([{"method": method, "id": 2, "params": params}]),
         );
-        let view = thread_view(&state);
-        assert_eq!(view.approval.unwrap().available_decisions, None);
+        thread_view(&state).approval.unwrap()
+    }
+
+    fn offered(decisions: Value) -> Approval {
+        requested(
+            "item/commandExecution/requestApproval",
+            json!({"availableDecisions": decisions}),
+        )
+    }
+
+    fn labels(approval: &Approval) -> Vec<(&str, bool)> {
+        approval
+            .choices
+            .iter()
+            .map(|choice| (choice.label.as_str(), choice.allow))
+            .collect()
+    }
+
+    #[test]
+    fn network_rules_for_one_host_read_differently_and_name_it() {
+        let allow = json!({"applyNetworkPolicyAmendment": {
+            "network_policy_amendment": {"host": "example.com", "action": "allow"}
+        }});
+        let deny = json!({"applyNetworkPolicyAmendment": {
+            "network_policy_amendment": {"host": "example.com", "action": "deny"}
+        }});
+        let approval = offered(json!(["accept", allow, deny, "decline"]));
+        assert_eq!(
+            labels(&approval),
+            [
+                ("Allow once", true),
+                ("Always allow example.com", true),
+                ("Always block example.com", false),
+                ("Decline", false),
+            ]
+        );
+        assert_eq!(approval.choices[1].decision, allow);
+        assert_eq!(approval.choices[2].decision, deny);
+    }
+
+    #[test]
+    fn allowing_for_the_session_is_an_allow() {
+        let approval = offered(json!(["acceptForSession", "cancel"]));
+        assert_eq!(
+            labels(&approval),
+            [
+                ("Allow for this session", true),
+                ("Decline and stop", false)
+            ]
+        );
+    }
+
+    #[test]
+    fn decisions_oterm_does_not_know_are_never_shown() {
+        let approval = offered(json!([
+            "accept",
+            "acceptForever",
+            {"rewriteCommand": {"argv": ["rm"]}},
+            {"acceptWithExecpolicyAmendment": {}},
+            {"acceptWithExecpolicyAmendment": {"execpolicy_amendment": "touch x"}},
+            {"applyNetworkPolicyAmendment": {"network_policy_amendment": {"host": "example.com"}}},
+            {"applyNetworkPolicyAmendment": {"network_policy_amendment": {"action": "allow"}}},
+            {"applyNetworkPolicyAmendment": {
+                "network_policy_amendment": {"host": "example.com", "action": "maybe"}
+            }},
+            {"accept": null, "cancel": null},
+            null,
+            7,
+            "decline"
+        ]));
+        assert_eq!(
+            labels(&approval),
+            [("Allow once", true), ("Decline", false)]
+        );
+    }
+
+    #[test]
+    fn nothing_recognised_leaves_no_choices() {
+        let approval = offered(json!(["acceptForever", {"somethingNew": {}}]));
+        assert!(approval.choices.is_empty());
+    }
+
+    #[test]
+    fn missing_or_malformed_decisions_fall_back_to_allow_or_decline() {
+        let fallback = [("Allow once", true), ("Decline", false)];
+        let missing = requested(
+            "item/commandExecution/requestApproval",
+            json!({"command": "touch x"}),
+        );
+        assert_eq!(labels(&missing), fallback);
+        assert_eq!(missing.choices[0].decision, json!("accept"));
+        assert_eq!(missing.choices[1].decision, json!("decline"));
+        assert_eq!(labels(&offered(json!({"accept": true}))), fallback);
+        assert_eq!(labels(&offered(json!([]))), fallback);
+        assert_eq!(labels(&offered(Value::Null)), fallback);
+    }
+
+    #[test]
+    fn file_changes_always_fall_back() {
+        let approval = requested(
+            "item/fileChange/requestApproval",
+            json!({"reason": "write outside the workspace"}),
+        );
+        assert_eq!(approval.kind, ApprovalKind::FileChange);
+        assert_eq!(
+            labels(&approval),
+            [("Allow once", true), ("Decline", false)]
+        );
     }
 
     #[test]

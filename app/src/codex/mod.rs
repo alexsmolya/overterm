@@ -541,7 +541,7 @@ pub fn codex_close(
 mod tests {
     use super::*;
     use overterm_core::Signal;
-    use overterm_core::codex::view::{Activity, Approval};
+    use overterm_core::codex::view::{Activity, Approval, Choice};
 
     fn view(
         activity: Activity,
@@ -565,7 +565,7 @@ mod tests {
             reason: None,
             command: Some("touch x".into()),
             cwd: None,
-            available_decisions: None,
+            choices: Vec::new(),
         })
     }
 
@@ -574,7 +574,14 @@ mod tests {
         available_decisions: Vec<Value>,
     ) -> Option<Approval> {
         Some(Approval {
-            available_decisions: Some(available_decisions),
+            choices: available_decisions
+                .into_iter()
+                .map(|decision| Choice {
+                    label: String::new(),
+                    allow: false,
+                    decision,
+                })
+                .collect(),
             ..approval(kind).unwrap()
         })
     }
